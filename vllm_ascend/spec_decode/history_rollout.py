@@ -1,14 +1,19 @@
 from typing import Optional
 
 import ray
+import enum
+import torch
 import numpy as np
-
+from typing import Optional
+from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm_ascend.spec_decode.interface import Proposer, SpecDcodeType
 from vllm_ascend.spec_decode.global_module.prefix_tree import get_history_trees
 
 class HistoryRolloutProposer(Proposer):
     def __init__(self, vllm_config, device, runner):
-        super.__init__(vllm_config)
         self.name = SpecDcodeType.HISTO
         self.device = device
         self.runner = runner
@@ -58,6 +63,28 @@ class HistoryRolloutProposer(Proposer):
         )
         return batch_draft_tokens
 
-    def load_model(self, *args, **kwargs):
+    def load_model(self, model):
         # No model to load.
+        pass
+
+    def dummy_run(self,
+                  num_tokens: int,
+                  with_prefill: bool = False,
+                  skip_attn: bool = False,
+                  num_reqs: int = 0,
+                  num_tokens_across_dp: Optional[torch.Tensor] = None,
+                  aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+                  batch_descriptor=None):
+        pass
+
+    def generate_token_ids(self,
+                           valid_sampled_token_ids: list[list[int]],
+                           sampling_metadata: SamplingMetadata = None,
+                           scheduler_output: SchedulerOutput = None,
+                           spec_decode_metadata: SpecDecodeMetadata = None,
+                           positions: torch.Tensor = None,
+                           num_scheduled_tokens: int = 0,
+                           hidden_states: torch.Tensor = None,
+                           attn_metadata=None,
+                           aux_hidden_states: torch.Tensor = None):
         pass
