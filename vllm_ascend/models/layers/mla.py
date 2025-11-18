@@ -34,7 +34,7 @@ from vllm.utils import direct_register_custom_op
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import vllm_version_is
 
-if vllm_version_is("0.11.0"):
+if vllm_version_is("0.11"):
     from vllm.attention import Attention
     from vllm.model_executor.layers.mla import \
         MultiHeadLatentAttention as MultiHeadLatentAttentionWrapper
