@@ -125,6 +125,7 @@ from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.sample.logits_processor import build_logitsprocs
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
+from vllm_ascend.spec_decode.history_rollout import HistoryRolloutProposer
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
 from vllm_ascend.spec_decode.interface import SpecDcodeType
 from vllm_ascend.spec_decode.mtp_proposer import MtpProposer
@@ -326,7 +327,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # Set up speculative decoding.
         self.spec_attn_mask = None
         self.drafter: Optional[Union[NgramProposer, EagleProposer,
-                                     MtpProposer]] = None
+                                     MtpProposer, HistoryRolloutProposer]] = None
         self.actual_seq_lengths_q: list[int] = []
         self.decode_token_per_req = 1
         if self.speculative_config:
@@ -1763,10 +1764,29 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # Speculative decoding is not enabled.
             draft_token_ids = None
         else:
-            draft_token_ids = self.drafter.generate_token_ids(
-                valid_sampled_token_ids, sampling_metadata, scheduler_output,
-                spec_decode_metadata, positions, num_scheduled_tokens,
-                hidden_states, attn_metadata, aux_hidden_states)
+            if self.drafter.name == SpecDcodeType.HISTO:
+                if len(valid_sampled_token_ids) > 3:
+                    accept_length_list = []
+                    sampled_token_id_list = []
+                    prompt_token_id_list = []
+                    for i, sampled_ids in enumerate(valid_sampled_token_ids):
+                        req_id = self.input_batch.req_ids[i]
+                        req_state = self.requests[req_id]
+                        accept_length_list.append(len(sampled_ids))
+                        sampled_token_id_list.append(req_state.output_token_ids + sampled_ids)
+                        prompt_token_id_list.append(req_state.prompt_token_ids)
+                    draft_token_ids = self.drafter.propose_batch(
+                        accept_length_list,
+                        sampled_token_id_list,
+                        prompt_token_id_list
+                    )
+                else:
+                    draft_token_ids = [[] for _ in range(len(valid_sampled_token_ids))]
+            else:
+                draft_token_ids = self.drafter.generate_token_ids(
+                    valid_sampled_token_ids, sampling_metadata, scheduler_output,
+                    spec_decode_metadata, positions, num_scheduled_tokens,
+                    hidden_states, attn_metadata, aux_hidden_states)
         return draft_token_ids
 
     def _pool(
