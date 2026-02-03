@@ -14,6 +14,7 @@ class SpecDcodeType(enum.Enum):
     EAGLE3 = 2
     MTP = 4
     HISTO = 5
+    HSPEC = 6  # Hidden State based Speculative Decoding
 
 
 class Proposer:
