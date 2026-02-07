@@ -17,6 +17,8 @@ import math
 import msgpack
 from enum import Enum
 
+from vllm_ascend.spec_decode.hspec_utils import stable_partition_id
+
 def best_path_node(nodes):
     best_child = None
     best_token = None
@@ -326,10 +328,10 @@ class GlobalRewardAwareSuffixTreeGroup:
         return len(self.groups)
     
     def _get_partition_id(self, prompt_id: str):
-        return (hash(prompt_id) % _num_groups)
+        return stable_partition_id(prompt_id, _num_groups)
 
     def _get_partition(self, prompt_id: str):
-        group_index = hash(prompt_id) % _num_groups
+        group_index = stable_partition_id(prompt_id, _num_groups)
         return self.groups[group_index]
     
     def add_tree(self, prompt_id):

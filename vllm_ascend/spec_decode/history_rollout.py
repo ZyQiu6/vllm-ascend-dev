@@ -11,6 +11,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm_ascend.spec_decode.interface import Proposer, SpecDcodeType
 from vllm_ascend.spec_decode.global_module.prefix_tree import get_history_trees
+from vllm_ascend.spec_decode.hspec_utils import prompt_id_from_token_ids
 
 class HistoryRolloutProposer(Proposer):
     def __init__(self, vllm_config, device, runner):
@@ -35,7 +36,7 @@ class HistoryRolloutProposer(Proposer):
         """Proposes the next sequence of tokens based on history rollout
         speculative decoding pattern.
         """
-        prompt_id = str(hash(tuple(prompt_token_ids)))
+        prompt_id = prompt_id_from_token_ids(prompt_token_ids)
         
         draft_tokens = []
         if len(sampled_token_ids) >= self.min_n:
@@ -53,7 +54,7 @@ class HistoryRolloutProposer(Proposer):
         speculative decoding pattern.
         """
         batch_size = len(accept_length_list)
-        prompt_id_list = [str(hash(tuple(prompt_token_id))) for prompt_token_id in prompt_token_id_list]
+        prompt_id_list = [prompt_id_from_token_ids(prompt_token_id) for prompt_token_id in prompt_token_id_list]
         prefix_length_list = [self.min_n for _ in range(batch_size)]
         batch_draft_tokens = self.history_trees.post_predict_batch(
             prompt_id_list,

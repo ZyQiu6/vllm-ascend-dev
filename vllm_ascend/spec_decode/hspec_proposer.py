@@ -30,6 +30,7 @@ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_ascend.spec_decode.interface import Proposer, SpecDcodeType
 from vllm_ascend.spec_decode.hspec_table import get_hspec_tables, GlobalHSpecTableGroup
+from vllm_ascend.spec_decode.hspec_utils import prompt_id_from_token_ids
 
 
 class HSpecProposer(Proposer):
@@ -96,7 +97,7 @@ class HSpecProposer(Proposer):
             List of draft token ids, or empty list if no match.
         """
         # Create prompt identifier
-        prompt_id = str(hash(tuple(prompt_token_ids)))
+        prompt_id = prompt_id_from_token_ids(prompt_token_ids)
         
         # Check if we have enough tokens and hidden state
         if len(sampled_token_ids) < self.min_match_len or hidden_state is None:
@@ -141,7 +142,7 @@ class HSpecProposer(Proposer):
         
         # Create prompt identifiers
         prompt_id_list = [
-            str(hash(tuple(prompt_token_ids))) 
+            prompt_id_from_token_ids(prompt_token_ids)
             for prompt_token_ids in prompt_token_id_list
         ]
         

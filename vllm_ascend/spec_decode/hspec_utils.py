@@ -18,8 +18,34 @@ This module provides helper functions for hidden state collection and processing
 """
 
 from typing import Optional, List, Tuple, Dict, Any
+import hashlib
+import struct
 import torch
 import numpy as np
+
+
+def prompt_id_from_token_ids(prompt_token_ids: List[int]) -> str:
+    """Compute a stable prompt_id from prompt token ids.
+    """
+    # Pack as little-endian uint32 stream to avoid ambiguity and reduce overhead.
+    # Token ids are expected to be non-negative.
+    buf = bytearray()
+    for tid in prompt_token_ids:
+        if tid < 0:
+            raise ValueError(f"prompt_token_ids must be non-negative, got {tid}")
+        buf += struct.pack("<I", int(tid))
+    # blake2b is fast and available in stdlib; digest_size=8 gives 64-bit id.
+    digest = hashlib.blake2b(buf, digest_size=8).hexdigest()
+    return f"p{digest}"
+
+
+def stable_partition_id(key: str, num_partitions: int) -> int:
+    """Stable partitioner for strings across processes."""
+    if num_partitions <= 0:
+        raise ValueError(f"num_partitions must be > 0, got {num_partitions}")
+    h = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
+    hv = int.from_bytes(h, byteorder="little", signed=False)
+    return hv % num_partitions
 
 
 class HiddenStateCollector:

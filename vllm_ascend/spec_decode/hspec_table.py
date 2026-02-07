@@ -27,6 +27,8 @@ from enum import Enum
 from typing import Optional, List, Dict, Tuple, Any
 import torch
 
+from vllm_ascend.spec_decode.hspec_utils import stable_partition_id
+
 
 class HSpecEntry:
     """Single entry in the HSpec query table.
@@ -218,7 +220,9 @@ class HSpecTableGroup:
         
         This is the main method called after rollout to populate the table.
         For each position i in the sequence, it stores:
-            hidden_state[i] -> token_sequence[i+1:]
+            hidden_state[i] -> token_sequence[i:]
+
+        This matches the HSpec design doc where the value is y[t:] (including y_t).
         
         Args:
             prompt_id: The prompt identifier.
@@ -231,12 +235,19 @@ class HSpecTableGroup:
         
         table = self._tables[prompt_id]
         seq_len = len(token_sequence)
+
+        # Strong alignment check to avoid silently polluting the table.
+        if len(hidden_states) != seq_len:
+            raise ValueError(
+                f"HSpec add_entries_batch misaligned: len(hidden_states)={len(hidden_states)} "
+                f"!= len(token_sequence)={seq_len} for prompt_id={prompt_id}"
+            )
         
         # For each position, store hidden_state -> remaining tokens
-        for i in range(min(len(hidden_states), seq_len - 1)):
-            remaining = token_sequence[i + 1:]
-            if len(remaining) > 0:
-                table.add_entry(hidden_states[i], remaining, reward)
+        for i in range(seq_len):
+            remaining = token_sequence[i:]
+            # remaining is non-empty by construction
+            table.add_entry(hidden_states[i], remaining, reward)
     
     def query(self, prompt_id: str, hidden_state: np.ndarray, 
               accept_length: int = 1) -> List[int]:
@@ -311,8 +322,7 @@ class HSpecTableGroup:
         self.match_times = 0
         self.total_draft_length = 0
     
-    # ==================== ZMQ Server Methods ====================
-    
+    # ZMQ Server Methods
     def run(self):
         """Run the ZMQ server for fast RPC communication."""
         context = zmq.Context()
@@ -358,8 +368,7 @@ class HSpecTableGroup:
             return {'error': f'Unknown method: {method}'}
 
 
-# ==================== Global HSpec Table Manager ====================
-
+# Global HSpec Table Manager
 _num_groups: int = 5  # Number of partitions (same as HistoSpec)
 _hspec_table_handles = []
 
@@ -417,15 +426,14 @@ class GlobalHSpecTableGroup:
     
     def _get_partition_id(self, prompt_id: str) -> int:
         """Get the partition id for a prompt."""
-        return hash(prompt_id) % _num_groups
+        return stable_partition_id(prompt_id, _num_groups)
     
     def _get_partition(self, prompt_id: str) -> ray.actor.ActorHandle:
         """Get the Ray actor for a prompt."""
         group_index = self._get_partition_id(prompt_id)
         return self.groups[group_index]
     
-    # ==================== Table Management ====================
-    
+    # Table Management
     def add_table(self, prompt_id: str):
         """Create a new query table for a prompt."""
         actor = self._get_partition(prompt_id)
@@ -457,8 +465,7 @@ class GlobalHSpecTableGroup:
         """Clear all tables."""
         return [p.clear.remote() for p in self.groups]
     
-    # ==================== Query Methods ====================
-    
+    # Query Methods
     def query(self, prompt_id: str, hidden_state: np.ndarray, accept_length: int = 1):
         """Query for draft tokens (Ray remote call)."""
         actor = self._get_partition(prompt_id)
@@ -560,8 +567,7 @@ class GlobalHSpecTableGroup:
         except Exception as e:
             return {'status': 'error', 'message': str(e)}
     
-    # ==================== Server Control ====================
-    
+    # Server Control
     def run_server(self):
         """Start ZMQ servers on all groups."""
         return [p.run.remote() for p in self.groups]
@@ -571,8 +577,7 @@ class GlobalHSpecTableGroup:
         for server_id in self.servers:
             self._post_to_server(server_id, {'method': 'stop', 'params': {}})
     
-    # ==================== Metrics ====================
-    
+    # Metrics
     def compute_metrics(self) -> Dict[str, float]:
         """Aggregate metrics from all groups."""
         tasks = [group.compute_metrics.remote() for group in self.groups]
