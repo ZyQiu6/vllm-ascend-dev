@@ -18,10 +18,13 @@ This module provides helper functions for hidden state collection and processing
 """
 
 from typing import Optional, List, Tuple, Dict, Any
+import logging
 import hashlib
 import struct
 import torch
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def prompt_id_from_token_ids(prompt_token_ids: List[int]) -> str:
@@ -292,6 +295,409 @@ def prepare_hidden_states_for_storage(
     valid_token_ids = [token_ids[i] for i in valid_positions]
     
     return valid_hidden_states, valid_token_ids
+
+
+# ============================================================
+# PCA Module for HSpec
+# ============================================================
+#
+# Design overview (see HSpec Tips.md §1, §2, §3.3):
+#
+#   Each prompt owns a set of PCA parameters (μ, W) computed from the
+#   anchor hidden states of its rollout trajectories in the *previous*
+#   epoch.
+#
+#     μ ∈ R^D        – centroid (mean of all anchor hidden states)
+#     W ∈ R^{K × D}  – top-K principal components (row vectors)
+#
+#   Projection:  z_t = (h_t − μ) · W^T ∈ R^K
+#
+#   The projected z_t serves as the *key* in the HSpec query table;
+#   the corresponding *value* is y[t:] (response tokens from position
+#   t onward).
+#
+#   Two usage modes:
+#     • PPO  (1 rollout per prompt per epoch)  → fit_pca_single_sequence
+#     • GRPO (N rollouts per prompt per epoch)  → fit_pca_multi_sequence
+#
+#   On-device (NPU) projection during decode hot-loop is provided by
+#   project_hidden_states_torch() which does a single matmul with
+#   *no* CPU round-trip.
+# ============================================================
+
+
+class PromptPCAParams:
+    """Fitted PCA parameters for a single prompt.
+
+    Instances are created during table-building (end of each epoch) and
+    cached by the proposer for online query in the next epoch.
+
+    Attributes:
+        prompt_id:    Stable identifier produced by prompt_id_from_token_ids.
+        mean:         Centroid μ, shape (D,), float32, C-contiguous.
+        components:   Top-K principal components W, shape (K, D), float32,
+                      C-contiguous.  Rows are the component directions.
+        n_components: Actual K used (may be < requested when N or D < K).
+        n_samples:    Number of token positions that were used for fitting.
+    """
+
+    __slots__ = ("prompt_id", "mean", "components", "n_components", "n_samples")
+
+    def __init__(
+        self,
+        prompt_id: str,
+        mean: np.ndarray,
+        components: np.ndarray,
+        n_samples: int,
+    ):
+        self.prompt_id = prompt_id
+        self.mean = np.ascontiguousarray(mean, dtype=np.float32)         # (D,)
+        self.components = np.ascontiguousarray(components, dtype=np.float32)  # (K, D)
+        self.n_components = int(components.shape[0])
+        self.n_samples = int(n_samples)
+
+    # ------------------------------------------------------------------
+    # CPU / numpy projection  (used during table-building)
+    # ------------------------------------------------------------------
+    def project(self, hidden_states: np.ndarray) -> np.ndarray:
+        """Project hidden states into the PCA space.
+
+        Z = (H − μ) · W^T
+
+        Args:
+            hidden_states: (N, D) array of anchor hidden states, or a
+                           single (D,) vector.
+
+        Returns:
+            (N, K) or (K,) projected array, dtype float32.
+        """
+        centered = hidden_states.astype(np.float32, copy=False) - self.mean
+        projected = centered @ self.components.T  # (N, K) or (K,)
+        return projected.astype(np.float32, copy=False)
+
+    # ------------------------------------------------------------------
+    # Torch conversion  (used to cache params on NPU for decode queries)
+    # ------------------------------------------------------------------
+    def to_torch(
+        self,
+        device: torch.device = torch.device("cpu"),
+        dtype: Optional[torch.dtype] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Export (μ, W) as torch tensors on the given device.
+
+        Returns:
+            mean_t:       (D,)    tensor on *device*.
+            components_t: (K, D)  tensor on *device*.
+
+        Notes:
+            - By default, we keep the original float32 numpy parameters
+              (dtype=None).
+            - For decode hot-loop performance, callers should pass a low
+              precision dtype (e.g. torch.float16 / torch.bfloat16) and
+              cache the returned tensors on device so that projection does
+              not upcast hidden_states each step.
+        """
+        mean_t = torch.from_numpy(self.mean).to(device=device, dtype=dtype, non_blocking=True)
+        components_t = torch.from_numpy(self.components).to(device=device, dtype=dtype, non_blocking=True)
+        return mean_t, components_t
+
+    def __repr__(self) -> str:
+        D = self.mean.shape[0]
+        return (
+            f"PromptPCAParams(prompt_id={self.prompt_id!r}, "
+            f"D={D}, K={self.n_components}, n_samples={self.n_samples})"
+        )
+
+
+def compute_pca(
+    hidden_states: np.ndarray,
+    n_components: int = 64,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute PCA parameters from anchor hidden states via economy SVD.
+
+    Given N token-level anchor hidden states of dimension D, compute the
+    centroid μ and the top-K principal component directions W.
+
+    Internally:
+        1. μ = mean(H, axis=0)
+        2. H_c = H − μ                         (centering)
+        3. U, S, V^T = SVD(H_c, full=False)    (economy SVD)
+        4. W = V^T[:K]                          (top-K rows)
+
+    Args:
+        hidden_states: (N, D) float array.  N = total token positions,
+                       D = model hidden dimension.
+        n_components:  Desired number of principal components K.
+
+    Returns:
+        mean:       (D,)        float32.
+        components: (K_act, D)  float32,  K_act = min(K, N, D).
+
+    Raises:
+        ValueError: If input is not 2-D or has zero rows.
+    """
+    if hidden_states.ndim != 2:
+        raise ValueError(
+            f"hidden_states must be 2-D (N, D), got shape {hidden_states.shape}"
+        )
+    N, D = hidden_states.shape
+    if N == 0:
+        raise ValueError("Cannot compute PCA on zero samples")
+
+    K = min(n_components, N, D)
+
+    # Upcast to float32 for numerical stability (no-copy if already f32).
+    hs = hidden_states.astype(np.float32, copy=False)
+
+    # 1. Centroid
+    mean = hs.mean(axis=0)       # (D,)
+
+    # 2. Center
+    centered = hs - mean         # (N, D)
+
+    # 3. Economy SVD: centered = U · diag(S) · V^T
+    #    Rows of V^T are principal component directions, sorted by
+    #    explained variance (descending singular values).
+    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+
+    # 4. Take top-K components
+    components = np.ascontiguousarray(Vt[:K], dtype=np.float32)  # (K, D)
+
+    return mean.astype(np.float32), components
+
+
+def fit_pca_single_sequence(
+    prompt_id: str,
+    hidden_states: np.ndarray,
+    n_components: int = 64,
+) -> Tuple[PromptPCAParams, np.ndarray]:
+    """Fit PCA on **one** rollout sequence and project  (PPO mode).
+
+    This is used when each prompt produces exactly one rollout trajectory
+    per epoch (the standard PPO setting).
+
+    Args:
+        prompt_id:     Stable prompt identifier.
+        hidden_states: (L, D) anchor hidden states aligned 1-to-1 with the
+                       response tokens y = [y_0, …, y_{L-1}].
+        n_components:  Number of PCA dimensions K.
+
+    Returns:
+        pca_params: PromptPCAParams holding (μ, W) for this prompt.
+        projected:  (L, K) projected key matrix  Z = (H − μ) W^T.
+
+    Raises:
+        ValueError: If hidden_states is not 2-D or is empty.
+    """
+    mean, components = compute_pca(hidden_states, n_components)
+    params = PromptPCAParams(
+        prompt_id=prompt_id,
+        mean=mean,
+        components=components,
+        n_samples=hidden_states.shape[0],
+    )
+    projected = params.project(hidden_states)  # (L, K)
+    return params, projected
+
+
+def fit_pca_multi_sequence(
+    prompt_id: str,
+    hidden_states_list: List[np.ndarray],
+    n_components: int = 64,
+) -> Tuple[PromptPCAParams, List[np.ndarray]]:
+    """Fit PCA on **multiple** rollout sequences and project each  (GRPO mode).
+
+    When a prompt is rolled out N times in one epoch (e.g. GRPO with
+    repeat-n), all N trajectories' anchor hidden states are *pooled*
+    together to compute a single set of PCA parameters (μ, W).  Each
+    trajectory is then projected independently to produce its own key
+    matrix Z_i.
+
+    Args:
+        prompt_id:          Stable prompt identifier.
+        hidden_states_list: List of (L_i, D) arrays, one per rollout
+                            trajectory.  Every array must have the same
+                            D (hidden dimension).
+        n_components:       Number of PCA dimensions K.
+
+    Returns:
+        pca_params:     Shared PromptPCAParams for this prompt.
+        projected_list: List of (L_i, K) projected key matrices, in the
+                        same order as *hidden_states_list*.
+
+    Raises:
+        ValueError: If the list is empty, or arrays have inconsistent D.
+    """
+    if not hidden_states_list:
+        raise ValueError("hidden_states_list must be non-empty")
+
+    # Validate consistent hidden dimension across sequences.
+    D = hidden_states_list[0].shape[-1]
+    for idx, hs in enumerate(hidden_states_list):
+        if hs.ndim != 2:
+            raise ValueError(
+                f"hidden_states_list[{idx}] must be 2-D, "
+                f"got shape {hs.shape}"
+            )
+        if hs.shape[1] != D:
+            raise ValueError(
+                f"Inconsistent hidden dim: hidden_states_list[0] has D={D}, "
+                f"but hidden_states_list[{idx}] has D={hs.shape[1]}"
+            )
+
+    # Concatenate all sequences for joint PCA fitting.
+    all_hs = np.concatenate(hidden_states_list, axis=0)  # (Σ L_i, D)
+
+    mean, components = compute_pca(all_hs, n_components)
+    params = PromptPCAParams(
+        prompt_id=prompt_id,
+        mean=mean,
+        components=components,
+        n_samples=all_hs.shape[0],
+    )
+
+    # Project each sequence individually.
+    projected_list = [params.project(hs) for hs in hidden_states_list]
+    return params, projected_list
+
+
+# ------------------------------------------------------------------
+# On-device (NPU / GPU) projection for decode hot-loop
+# ------------------------------------------------------------------
+
+def project_hidden_states_torch(
+    hidden_states: torch.Tensor,
+    mean: torch.Tensor,
+    components: torch.Tensor,
+) -> torch.Tensor:
+    """Project hidden states on device via a single matmul  (zero CPU sync).
+
+    This is the **hot-path** operation executed every decode step inside
+    the proposer.  All three tensors must already reside on the *same*
+    device (NPU / GPU).
+
+        z = (h − μ) · W^T
+
+    Args:
+        hidden_states: (B, D) batch of anchor hidden states, or (D,)
+                       for a single request.
+        mean:          (D,)   PCA centroid μ.
+        components:    (K, D) PCA components W.
+
+    Returns:
+        (B, K) or (K,) projected tensor, same dtype/device as inputs.
+    """
+    # IMPORTANT (performance):
+    # - Do NOT unconditionally upcast to fp32 here; the caller should cache
+    #   (mean, components) in the same dtype as hidden_states (fp16/bf16)
+    #   before entering the decode hot-loop.
+    #
+    # We keep a small defensive cast in case a caller passes mismatched dtypes.
+    target_dtype = hidden_states.dtype
+    if mean.dtype != target_dtype:
+        mean = mean.to(dtype=target_dtype)
+    if components.dtype != target_dtype:
+        components = components.to(dtype=target_dtype)
+
+    centered = hidden_states - mean
+    return torch.matmul(centered, components.t())
+
+
+def batch_project_and_match_torch(
+    hidden_states: torch.Tensor,
+    mean: torch.Tensor,
+    components: torch.Tensor,
+    keys: torch.Tensor,
+    threshold: float = 0.9,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Project + cosine-similarity matching entirely on device.
+
+    Combines projection and matching into a single fused pipeline so
+    that the decode hot-loop never touches the CPU:
+
+        1. z = (h − μ) · W^T               (projection)
+        2. z_n = z / ‖z‖                    (L2-normalise)
+        3. sim = z_n · keys^T               (dot-product similarity)
+        4. best = argmax(sim)               (per-query best match)
+
+    Args:
+        hidden_states: (B, D)  batch of anchor hidden states.
+        mean:          (D,)    PCA centroid μ.
+        components:    (K, D)  PCA components W.
+        keys:          (M, K)  stored keys, **already L2-normalised**.
+        threshold:     Minimum cosine similarity for a valid match.
+
+    Returns:
+        best_indices:      (B,) long tensor.  Index into *keys* for the
+                           best match; **-1** when no key exceeds the
+                           threshold.
+        best_similarities: (B,) float tensor.  The similarity score of
+                           the best match (0.0 when no match).
+    """
+    # 1. Project  → (B, K)
+    z = project_hidden_states_torch(hidden_states, mean, components)
+
+    # 2. L2-normalise queries
+    z_norm = torch.nn.functional.normalize(z, p=2, dim=-1)  # (B, K)
+
+    # 3. Cosine similarity matrix  → (B, M)
+    # Keep matmul in low precision for throughput. Ensure dtype alignment.
+    if keys.dtype != z_norm.dtype:
+        z_norm = z_norm.to(dtype=keys.dtype)
+    sims = torch.matmul(z_norm, keys.t())
+
+    # 4. Per-query best match
+    best_sims, best_idxs = sims.max(dim=-1)  # (B,) each
+
+    # 5. Mask out below-threshold matches
+    no_match = best_sims < threshold
+    best_idxs = best_idxs.clone()
+    best_idxs[no_match] = -1
+    best_sims = best_sims.clone()
+    best_sims[no_match] = 0.0
+
+    return best_idxs, best_sims
+
+
+# ------------------------------------------------------------------
+# Alignment validation  (design-doc §7: "必做检查")
+# ------------------------------------------------------------------
+
+def validate_hidden_state_alignment(
+    hidden_states: np.ndarray,
+    response_tokens: List[int],
+) -> bool:
+    """Check that hidden states and response tokens are properly aligned.
+
+    The HSpec design doc mandates ``len(H) == len(y)`` as a **hard**
+    prerequisite before any data enters the query table.  Misaligned
+    entries silently pollute the table and cause low match rates that
+    are very difficult to diagnose.
+
+    Args:
+        hidden_states: (L, D) array of anchor hidden states.
+        response_tokens: Response token id list y = [y_0, …, y_{L-1}].
+
+    Returns:
+        True if and only if the lengths match and shapes are valid.
+    """
+    if hidden_states.ndim != 2:
+        logger.warning(
+            "validate_hidden_state_alignment: expected 2-D hidden_states, "
+            "got shape %s",
+            hidden_states.shape,
+        )
+        return False
+    aligned = hidden_states.shape[0] == len(response_tokens)
+    if not aligned:
+        logger.warning(
+            "validate_hidden_state_alignment FAILED: "
+            "len(hidden_states)=%d != len(response_tokens)=%d  — "
+            "this trajectory will be discarded.",
+            hidden_states.shape[0],
+            len(response_tokens),
+        )
+    return aligned
 
 
 class HSpecConfig:
