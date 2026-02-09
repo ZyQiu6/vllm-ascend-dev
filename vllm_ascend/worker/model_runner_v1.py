@@ -349,6 +349,24 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 range(self.decode_token_per_req, self.max_num_tokens + 1,
                       self.decode_token_per_req))
 
+        # HSpec: hidden state collection flag.
+        # When enabled, the model_runner accumulates the anchor hidden
+        # state (the hidden state used to predict / verify each accepted
+        # token) per request at every decode step.  The accumulated data
+        # is stored in a global per-process store and flushed to CPU
+        # after LLM.generate() returns.
+        self._hspec_collect = (
+            self.speculative_config is not None
+            and getattr(self.speculative_config, 'method', '') == 'hspec'
+        )
+        if self._hspec_collect:
+            from vllm_ascend.spec_decode.hspec_utils import (
+                hspec_set_collection_enabled,
+            )
+            hspec_set_collection_enabled(True)
+            logger.info("HSpec: anchor hidden-state collection enabled "
+                        "in model_runner")
+
         # kv role
         self.is_kv_producer = False
         self.is_kv_consumer = False
@@ -1750,6 +1768,71 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         )
         return logits.to(self.device).to(logits_dtype)
 
+    # HSpec: hidden-state accumulation
+    def _hspec_accumulate_hidden_states(
+        self,
+        sample_hidden_states: torch.Tensor,
+        valid_sampled_token_ids: list[list[int]],
+        spec_decode_metadata: Optional[SpecDecodeMetadata],
+    ) -> None:
+        """Accumulate anchor hidden states for HSpec table building.
+
+        This is called once per ``execute_model()`` step, right after
+        tokens are accepted and before the next draft proposal.
+
+        **Non-spec decode** (``spec_decode_metadata is None``):
+            ``sample_hidden_states`` has shape ``(num_reqs, D)`` with a
+            simple 1-to-1 mapping: ``sample_hidden_states[i]`` is the
+            anchor for request ``req_ids[i]``.
+
+        **Spec decode with no drafts** (``num_draft_tokens[i] == 0``):
+            The request falls back to single-token decode.  Its anchor
+            hidden state is at ``bonus_logits_indices[i]`` inside the
+            extended ``sample_hidden_states`` tensor.
+
+        **Spec decode with drafts** (``num_draft_tokens[i] > 0``):
+            Proper per-accepted-token hidden-state extraction requires
+            non-trivial index arithmetic.  As recommended by the design
+            doc (§3.3), we **skip** collection for these steps to avoid
+            misaligned ("polluted") entries.  Coverage may be slightly
+            lower in subsequent epochs but data quality is guaranteed.
+        """
+        from vllm_ascend.spec_decode.hspec_utils import hspec_append_step_hs
+
+        num_reqs = self.input_batch.num_reqs
+        n = min(num_reqs, len(valid_sampled_token_ids))
+
+        if spec_decode_metadata is None:
+            # Non-spec decode: simple 1-to-1 mapping
+            for i in range(n):
+                sampled_ids = valid_sampled_token_ids[i]
+                if not sampled_ids:
+                    continue
+                req_id = self.input_batch.req_ids[i]
+                # Clone on device in fp16 to save memory.  The clone
+                # is necessary because `sample_hidden_states` is a
+                # view into `hidden_states` which is overwritten each
+                # step.
+                hspec_append_step_hs(
+                    req_id, sample_hidden_states[i].clone().half())
+        else:
+            # Spec decode path
+            num_draft_list = spec_decode_metadata.num_draft_tokens
+            bonus_indices = spec_decode_metadata.bonus_logits_indices
+            for i in range(n):
+                sampled_ids = valid_sampled_token_ids[i]
+                if not sampled_ids:
+                    continue
+                if num_draft_list[i] == 0:
+                    # No drafts for this request – bonus position is
+                    # the normal single-token decode position.
+                    bonus_idx = bonus_indices[i].item()
+                    req_id = self.input_batch.req_ids[i]
+                    hspec_append_step_hs(
+                        req_id,
+                        sample_hidden_states[bonus_idx].clone().half())
+                # else: has draft tokens → skip (design-doc fallback)
+
     def propose_draft_token_ids(
         self,
         valid_sampled_token_ids: list[list[int]],
@@ -2160,6 +2243,18 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 req_id = self.input_batch.req_ids[req_idx]
                 req_state = self.requests[req_id]
                 req_state.output_token_ids.extend(sampled_ids)
+
+            # HSpec: accumulate anchor hidden states
+            # After tokens are accepted but before drafting next step.
+            # sample_hidden_states is still valid (not yet overwritten).
+            if (self._hspec_collect
+                    and not self.use_async_scheduling
+                    and sample_hidden_states is not None):
+                self._hspec_accumulate_hidden_states(
+                    sample_hidden_states,
+                    valid_sampled_token_ids,
+                    spec_decode_metadata,
+                )
 
             if self.speculative_config:
                 self._draft_token_ids = self.propose_draft_token_ids(

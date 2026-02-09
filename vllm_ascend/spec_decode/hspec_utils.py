@@ -297,9 +297,7 @@ def prepare_hidden_states_for_storage(
     return valid_hidden_states, valid_token_ids
 
 
-# ============================================================
 # PCA Module for HSpec
-# ============================================================
 #
 # Design overview (see HSpec Tips.md §1, §2, §3.3):
 #
@@ -356,9 +354,7 @@ class PromptPCAParams:
         self.n_components = int(components.shape[0])
         self.n_samples = int(n_samples)
 
-    # ------------------------------------------------------------------
     # CPU / numpy projection  (used during table-building)
-    # ------------------------------------------------------------------
     def project(self, hidden_states: np.ndarray) -> np.ndarray:
         """Project hidden states into the PCA space.
 
@@ -375,9 +371,7 @@ class PromptPCAParams:
         projected = centered @ self.components.T  # (N, K) or (K,)
         return projected.astype(np.float32, copy=False)
 
-    # ------------------------------------------------------------------
     # Torch conversion  (used to cache params on NPU for decode queries)
-    # ------------------------------------------------------------------
     def to_torch(
         self,
         device: torch.device = torch.device("cpu"),
@@ -561,9 +555,7 @@ def fit_pca_multi_sequence(
     return params, projected_list
 
 
-# ------------------------------------------------------------------
 # On-device (NPU / GPU) projection for decode hot-loop
-# ------------------------------------------------------------------
 
 def project_hidden_states_torch(
     hidden_states: torch.Tensor,
@@ -659,9 +651,7 @@ def batch_project_and_match_torch(
     return best_idxs, best_sims
 
 
-# ------------------------------------------------------------------
 # Alignment validation  (design-doc §7: "必做检查")
-# ------------------------------------------------------------------
 
 def validate_hidden_state_alignment(
     hidden_states: np.ndarray,
@@ -698,6 +688,132 @@ def validate_hidden_state_alignment(
             len(response_tokens),
         )
     return aligned
+
+
+# Global Hidden State Store for HSpec Collection
+#
+# This module-level store allows the model_runner to accumulate
+# anchor hidden states during generation, and the rollout code to
+# retrieve them after generation completes.
+#
+# Design-doc compliance (§3.3, §7):
+#   - No per-token .cpu() sync: tensors are cloned on-device and
+#     transferred to CPU only once per request at flush time.
+#   - Alignment guarantee: callers must ensure len(H) == len(y)
+#     before feeding data into the HSpec table.
+#
+# Flow:
+#   1. model_runner calls hspec_append_step_hs() each decode step.
+#   2. After LLM.generate() returns, rollout calls
+#      hspec_flush_and_get_all() which transfers device tensors to
+#      CPU and returns the complete store.
+#   3. The store is cleared for the next generation batch.
+# ============================================================
+
+import threading as _threading
+
+_hspec_store_lock = _threading.Lock()
+
+# Device-side accumulation buffers:  req_id -> list of (hidden_dim,) tensors
+_hspec_device_buffers: Dict[str, List[torch.Tensor]] = {}
+
+# Whether collection is enabled (set by model_runner at init)
+_hspec_collection_enabled: bool = False
+
+
+def hspec_set_collection_enabled(enabled: bool):
+    """Enable or disable hidden state collection globally."""
+    global _hspec_collection_enabled
+    _hspec_collection_enabled = enabled
+
+
+def hspec_is_collection_enabled() -> bool:
+    """Check if hidden state collection is enabled."""
+    return _hspec_collection_enabled
+
+
+def hspec_append_step_hs(req_id: str, hidden_state: torch.Tensor):
+    """Append one anchor hidden state for a request.
+
+    Called by model_runner at each decode step.  The *hidden_state*
+    must already be ``.clone()``'d on the caller side so that it is
+    safe from in-place overwrites by subsequent steps.
+
+    The tensor stays on the device until :func:`hspec_flush_and_get_all`
+    or :func:`hspec_pop_request` is called.  This avoids per-token
+    device→host synchronisation (design-doc §7 perf rule).
+
+    Args:
+        req_id:       Internal vLLM request id.
+        hidden_state: 1-D tensor of shape ``(hidden_dim,)`` **already
+                      cloned** on the compute device.
+    """
+    if not _hspec_collection_enabled:
+        return
+    # NOTE: vLLM has multiple "request id" namespaces:
+    # - V1 scheduler/model_runner often uses an internal integer `req_id`
+    # - Frontend RequestOutput uses a (string) `request_id`
+    # Normalize keys to string so producer (model_runner) and consumer
+    # (output_processor / rollout) can consistently match.
+    req_id = str(req_id)
+    with _hspec_store_lock:
+        if req_id not in _hspec_device_buffers:
+            _hspec_device_buffers[req_id] = []
+        _hspec_device_buffers[req_id].append(hidden_state)
+
+
+def hspec_flush_and_get_all() -> Dict[str, np.ndarray]:
+    """Flush **all** device buffers to CPU and return the complete store.
+
+    This is the main entry point called by the rollout code *after*
+    ``LLM.generate()`` returns.  It performs one device→host transfer
+    per request (a single ``torch.stack(...).cpu()``), converts to
+    float16 numpy arrays, and clears the device buffers.
+
+    Returns:
+        Dictionary mapping ``req_id`` → ``np.ndarray`` of shape
+        ``(seq_len, hidden_dim)`` in ``float16``.
+    """
+    with _hspec_store_lock:
+        result: Dict[str, np.ndarray] = {}
+        for req_id, tensors in _hspec_device_buffers.items():
+            if tensors:
+                # Stack all step tensors → (seq_len, hidden_dim)
+                stacked = torch.stack(tensors)
+                # Single device→host transfer per request
+                cpu_array = stacked.to(dtype=torch.float16).cpu().numpy()
+                result[str(req_id)] = cpu_array
+        _hspec_device_buffers.clear()
+        return result
+
+
+def hspec_pop_request(req_id: str) -> Optional[np.ndarray]:
+    """Pop hidden states for a *single* request.
+
+    Used by the output-processor when a request finishes (streaming
+    scenario).  Falls back to the device buffer if not yet flushed.
+
+    Returns:
+        ``np.ndarray`` of shape ``(seq_len, hidden_dim)`` in float16,
+        or ``None`` if no data is stored for *req_id*.
+    """
+    req_id = str(req_id)
+    with _hspec_store_lock:
+        if req_id in _hspec_device_buffers:
+            tensors = _hspec_device_buffers.pop(req_id)
+            if tensors:
+                stacked = torch.stack(tensors)
+                return stacked.to(dtype=torch.float16).cpu().numpy()
+        return None
+
+
+def hspec_clear_store():
+    """Clear all stored hidden states (both device and CPU)."""
+    with _hspec_store_lock:
+        # Explicitly delete tensors to free device memory promptly
+        for tensors in _hspec_device_buffers.values():
+            tensors.clear()
+        _hspec_device_buffers.clear()
 
 
 class HSpecConfig:

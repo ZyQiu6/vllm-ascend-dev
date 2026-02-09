@@ -311,9 +311,14 @@ class HSpecProposer(Proposer):
         if batch_size == 0:
             return []
         
-        # Extract hidden states at logits positions
-        # For speculative decoding, we use the hidden state at the last sampled position
-        hidden_states_np = hidden_states.cpu().numpy()
+        # Extract hidden states at logits positions.
+        # NOTE(Ascend): torch.bfloat16 -> numpy is not supported directly.
+        # Cast to float16/float32 before transferring to CPU.
+        # hidden_states_np = hidden_states.cpu().numpy()
+        hs = hidden_states
+        if isinstance(hs, torch.Tensor) and hs.dtype == torch.bfloat16:
+            hs = hs.to(dtype=torch.float16)
+        hidden_states_np = hs.cpu().numpy()
         
         # Build hidden state list for each request
         hidden_state_list = []
