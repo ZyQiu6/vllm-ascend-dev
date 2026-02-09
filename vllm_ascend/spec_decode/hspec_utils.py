@@ -1,4 +1,4 @@
-# Copyright 2025 HSpec Authors
+# Copyright 2026 Xuyi
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -321,7 +321,6 @@ def prepare_hidden_states_for_storage(
 #   On-device (NPU) projection during decode hot-loop is provided by
 #   project_hidden_states_torch() which does a single matmul with
 #   *no* CPU round-trip.
-# ============================================================
 
 
 class PromptPCAParams:
@@ -651,7 +650,7 @@ def batch_project_and_match_torch(
     return best_idxs, best_sims
 
 
-# Alignment validation  (design-doc §7: "必做检查")
+# Alignment validation
 
 def validate_hidden_state_alignment(
     hidden_states: np.ndarray,
@@ -696,7 +695,7 @@ def validate_hidden_state_alignment(
 # anchor hidden states during generation, and the rollout code to
 # retrieve them after generation completes.
 #
-# Design-doc compliance (§3.3, §7):
+# Compliance:
 #   - No per-token .cpu() sync: tensors are cloned on-device and
 #     transferred to CPU only once per request at flush time.
 #   - Alignment guarantee: callers must ensure len(H) == len(y)
@@ -708,7 +707,6 @@ def validate_hidden_state_alignment(
 #      hspec_flush_and_get_all() which transfers device tensors to
 #      CPU and returns the complete store.
 #   3. The store is cleared for the next generation batch.
-# ============================================================
 
 import threading as _threading
 
@@ -741,7 +739,7 @@ def hspec_append_step_hs(req_id: str, hidden_state: torch.Tensor):
 
     The tensor stays on the device until :func:`hspec_flush_and_get_all`
     or :func:`hspec_pop_request` is called.  This avoids per-token
-    device→host synchronisation (design-doc §7 perf rule).
+    device→host synchronisation.
 
     Args:
         req_id:       Internal vLLM request id.
