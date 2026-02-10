@@ -616,6 +616,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
+            # HSpec: clear per-request proposer state on completion.
+            if (self.drafter is not None
+                    and getattr(self.drafter, "name", None) == SpecDcodeType.HSPEC
+                    and hasattr(self.drafter, "clear_request")):
+                try:
+                    self.drafter.clear_request(req_id)
+                except Exception:
+                    pass
 
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
@@ -1780,22 +1788,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         This is called once per ``execute_model()`` step, right after
         tokens are accepted and before the next draft proposal.
 
-        **Non-spec decode** (``spec_decode_metadata is None``):
-            ``sample_hidden_states`` has shape ``(num_reqs, D)`` with a
-            simple 1-to-1 mapping: ``sample_hidden_states[i]`` is the
-            anchor for request ``req_ids[i]``.
-
-        **Spec decode with no drafts** (``num_draft_tokens[i] == 0``):
-            The request falls back to single-token decode.  Its anchor
-            hidden state is at ``bonus_logits_indices[i]`` inside the
-            extended ``sample_hidden_states`` tensor.
-
-        **Spec decode with drafts** (``num_draft_tokens[i] > 0``):
-            Proper per-accepted-token hidden-state extraction requires
-            non-trivial index arithmetic.  As recommended by the design
-            doc (§3.3), we **skip** collection for these steps to avoid
-            misaligned ("polluted") entries.  Coverage may be slightly
-            lower in subsequent epochs but data quality is guaranteed.
         """
         from vllm_ascend.spec_decode.hspec_utils import hspec_append_step_hs
 
@@ -1844,6 +1836,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         hidden_states: torch.Tensor,
         attn_metadata: dict[str, Any],
         aux_hidden_states: torch.Tensor = None,
+        sample_hidden_states: torch.Tensor = None,
     ) -> Optional[list[list[int]]]:
         if not self.drafter:
             # Speculative decoding is not enabled.
@@ -1867,6 +1860,19 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     )
                 else:
                     draft_token_ids = [[] for _ in range(len(valid_sampled_token_ids))]
+            elif self.drafter.name == SpecDcodeType.HSPEC:
+                # HSpec: pass sample_hidden_states (indexed at logits
+                # positions) for correct per-request anchor extraction.
+                hs_for_hspec = (
+                    sample_hidden_states
+                    if sample_hidden_states is not None
+                    else hidden_states
+                )
+                draft_token_ids = self.drafter.generate_token_ids(
+                    valid_sampled_token_ids, sampling_metadata,
+                    scheduler_output, spec_decode_metadata, positions,
+                    num_scheduled_tokens, hs_for_hspec, attn_metadata,
+                    aux_hidden_states)
             else:
                 draft_token_ids = self.drafter.generate_token_ids(
                     valid_sampled_token_ids, sampling_metadata, scheduler_output,
@@ -2017,6 +2023,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
             if self.dynamic_eplb:
                 self.eplb_updator.take_update_info_from_eplb_process()
+
+            # HSpec: fire async prefetch *before* the forward pass so Ray
+            # futures have the full forward-pass latency (~10-100 ms) to
+            # resolve.  By the time generate_token_ids() is called the
+            # cache is typically warm → zero blocking in the hot loop.
+            if (self._hspec_collect and self.drafter is not None
+                    and hasattr(self.drafter, 'prefetch_for_batch')):
+                self.drafter.prefetch_for_batch(
+                    self.input_batch.req_ids[:self.input_batch.num_reqs])
 
         moe_comm_type = self._select_moe_comm_method(num_input_tokens,
                                                      self.with_prefill)
@@ -2244,6 +2259,21 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 req_state = self.requests[req_id]
                 req_state.output_token_ids.extend(sampled_ids)
 
+            # HSpec: feed per-request accept lengths to proposer for local
+            # window control (wnd_size congestion control).
+            if (not self.use_async_scheduling
+                    and self.drafter is not None
+                    and getattr(self.drafter, "name", None) == SpecDcodeType.HSPEC
+                    and hasattr(self.drafter, "update_accept_lengths")):
+                try:
+                    n = len(valid_sampled_token_ids)
+                    self.drafter.update_accept_lengths(
+                        self.input_batch.req_ids[:n],
+                        [len(x) for x in valid_sampled_token_ids],
+                    )
+                except Exception:
+                    pass
+
             # HSpec: accumulate anchor hidden states
             # After tokens are accepted but before drafting next step.
             # sample_hidden_states is still valid (not yet overwritten).
@@ -2267,6 +2297,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     hidden_states,
                     attn_metadata,
                     aux_hidden_states,
+                    sample_hidden_states=sample_hidden_states,
                 )
 
             if has_kv_transfer_group():

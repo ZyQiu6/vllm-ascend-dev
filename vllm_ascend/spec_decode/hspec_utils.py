@@ -298,29 +298,6 @@ def prepare_hidden_states_for_storage(
 
 
 # PCA Module for HSpec
-#
-# Design overview (see HSpec Tips.md §1, §2, §3.3):
-#
-#   Each prompt owns a set of PCA parameters (μ, W) computed from the
-#   anchor hidden states of its rollout trajectories in the *previous*
-#   epoch.
-#
-#     μ ∈ R^D        – centroid (mean of all anchor hidden states)
-#     W ∈ R^{K × D}  – top-K principal components (row vectors)
-#
-#   Projection:  z_t = (h_t − μ) · W^T ∈ R^K
-#
-#   The projected z_t serves as the *key* in the HSpec query table;
-#   the corresponding *value* is y[t:] (response tokens from position
-#   t onward).
-#
-#   Two usage modes:
-#     • PPO  (1 rollout per prompt per epoch)  → fit_pca_single_sequence
-#     • GRPO (N rollouts per prompt per epoch)  → fit_pca_multi_sequence
-#
-#   On-device (NPU) projection during decode hot-loop is provided by
-#   project_hidden_states_torch() which does a single matmul with
-#   *no* CPU round-trip.
 
 
 class PromptPCAParams:

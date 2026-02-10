@@ -13,17 +13,6 @@
 # limitations under the License.
 """
 HSpec: Hidden State based Speculative Decoding – Query Table.
-
-High-performance table implementation with:
-  - Continuous ndarray keys  (M, K)  float16, L2-normalised PCA projections
-  - Reference-based value storage: O(L) per rollout instead of O(L²)
-  - Per-prompt PCA parameters (μ, W) for on-device projection
-  - Batch build / query interfaces for high throughput
-  - Partitioned Ray actors with ZMQ RPC for distributed serving
-
-Design-doc references:
-  §4  table structure          §3.1 service layer
-  §6  async build              §7   perf rules & metrics
 """
 
 import logging
@@ -58,7 +47,7 @@ class PromptTableData:
         "rewards",
         "n_entries",
         "max_entries",
-        # adaptive window  (design-doc §5.3)
+        # adaptive window
         "wnd_size",
         "max_wnd",
         "min_wnd",
@@ -226,13 +215,20 @@ class HSpecTableGroup:
         max_entries_per_prompt: int = 10_000,
         n_components: int = 64,
     ):
-        self._tables: Dict[str, PromptTableData] = {}
+        # Double-buffered tables
+        #   _active  : read-only during decode (online query)
+        #   _building: write-only during build phase
+        #   swap()   : building → active at epoch boundary
+        self._active: Dict[str, PromptTableData] = {}
+        self._building: Dict[str, PromptTableData] = {}
+        self._active_version: int = 0
+
         self.similarity_threshold = similarity_threshold
         self.max_entries = max_entries_per_prompt
         self.n_components = n_components
         self.port = port
 
-        # Metrics
+        # Metrics (track queries on active tables)
         self._query_count = 0
         self._match_count = 0
         self._total_draft_len = 0
@@ -261,7 +257,7 @@ class HSpecTableGroup:
             token_seq_list:     [list[int] | ndarray] per rollout.
             rewards:            [float] per rollout.
         """
-        # ① Validate & filter  (design-doc §7: hard alignment check)
+        # ① Validate & filter
         valid_hs: List[np.ndarray] = []
         valid_tok: List[Any] = []
         valid_rew: List[float] = []
@@ -321,7 +317,7 @@ class HSpecTableGroup:
             table.add_rollout(proj, tok_arr, rew)
 
         table.compact()
-        self._tables[prompt_id] = table
+        self._building[prompt_id] = table
         self._build_count += 1
 
     def build_tables_batch(self, prompt_data_dict: Dict[str, Dict]):
@@ -356,10 +352,10 @@ class HSpecTableGroup:
         against the stored PCA-projected keys.
         """
         self._query_count += 1
-        if prompt_id not in self._tables:
+        if prompt_id not in self._active:
             return []
 
-        table = self._tables[prompt_id]
+        table = self._active[prompt_id]
         # Project  → (K,) and L2-normalise
         z = table.pca_params.project(
             hidden_state.reshape(1, -1).astype(np.float32, copy=False)
@@ -388,26 +384,26 @@ class HSpecTableGroup:
             )
         ]
 
-    # ── Table data access  (for proposer prefetch / cache) ──
+    # Table data access  (for proposer prefetch / cache)
 
     def get_prompt_pca(self, prompt_id: str):
         """Return ``(mean, components)`` numpy arrays, or ``None``."""
-        if prompt_id not in self._tables:
+        if prompt_id not in self._active:
             return None
-        t = self._tables[prompt_id]
+        t = self._active[prompt_id]
         return (t.pca_params.mean.copy(), t.pca_params.components.copy())
 
     def get_prompt_keys(self, prompt_id: str):
         """Return keys ndarray ``(n_entries, K)`` for prompt, or ``None``."""
-        if prompt_id not in self._tables:
+        if prompt_id not in self._active:
             return None
-        return self._tables[prompt_id].get_keys_numpy()
+        return self._active[prompt_id].get_keys_numpy()
 
     def get_prompt_table_data(self, prompt_id: str):
         """Return serialisable dict with full table data for proposer cache."""
-        if prompt_id not in self._tables:
+        if prompt_id not in self._active:
             return None
-        t = self._tables[prompt_id]
+        t = self._active[prompt_id]
         return {
             "mean": t.pca_params.mean,
             "components": t.pca_params.components,
@@ -426,25 +422,76 @@ class HSpecTableGroup:
     # Management
 
     def delete(self, prompt_id: str):
-        """Delete a prompt's table."""
-        self._tables.pop(prompt_id, None)
+        """Delete a prompt's table from building side."""
+        self._building.pop(prompt_id, None)
 
     def clear(self):
-        """Clear all tables and reset metrics."""
-        self._tables.clear()
+        """Clear all tables (both active and building) and reset metrics."""
+        self._active.clear()
+        self._building.clear()
         self._reset_metrics()
 
     def exist(self, prompt_id: str) -> bool:
-        return prompt_id in self._tables
+        return prompt_id in self._active
 
     def get_prompt_ids(self) -> List[str]:
-        return list(self._tables.keys())
+        return list(self._active.keys())
 
     def num_prompts(self) -> int:
-        return len(self._tables)
+        return len(self._active)
 
     def total_entries(self) -> int:
-        return sum(t.n_entries for t in self._tables.values())
+        return sum(t.n_entries for t in self._active.values())
+
+    # Double-buffer version management
+
+    def swap(self):
+        """Swap building → active.  Resets query metrics for new epoch."""
+        self._active = self._building
+        self._building = {}
+        self._active_version += 1
+        self._reset_metrics()
+        logger.info(
+            "HSpec swap: active_version=%d, prompts=%d, entries=%d",
+            self._active_version, len(self._active), self.total_entries(),
+        )
+
+    def get_active_version(self) -> int:
+        """Return current active table version (epoch counter)."""
+        return self._active_version
+
+    def get_active_table_data_batch(
+        self, prompt_ids: List[str],
+    ) -> Tuple[int, Dict[str, Optional[Dict]]]:
+        """Batch fetch table data from *active* tables for proposer prefetch.
+
+        Returns ``(active_version, {prompt_id: table_data | None})``.
+        The version is piggy-backed so the proposer can detect epoch
+        swaps without a separate RPC – one fewer round trip.
+        """
+        result: Dict[str, Optional[Dict]] = {}
+        for pid in prompt_ids:
+            if pid not in self._active:
+                result[pid] = None
+                continue
+            t = self._active[pid]
+            result[pid] = {
+                "mean": t.pca_params.mean.copy(),
+                "components": t.pca_params.components.copy(),
+                "keys": t.get_keys_numpy(),
+                "rollout_seqs": [np.ascontiguousarray(s) for s in t.rollout_seqs],
+                "entry_rollout_idx": np.ascontiguousarray(
+                    t.entry_rollout_idx[: t.n_entries]
+                ),
+                "entry_offset": np.ascontiguousarray(
+                    t.entry_offset[: t.n_entries]
+                ),
+                "n_entries": t.n_entries,
+                "wnd_size": t.wnd_size,
+                "max_wnd": t.max_wnd,
+                "min_wnd": t.min_wnd,
+            }
+        return (self._active_version, result)
 
     # Metrics
 
@@ -455,7 +502,7 @@ class HSpecTableGroup:
             "total_draft_length": self._total_draft_len,
             "build_count": self._build_count,
             "discard_count": self._discard_count,
-            "num_prompts": len(self._tables),
+            "num_prompts": len(self._active),
             "total_entries": self.total_entries(),
         }
 
@@ -727,6 +774,77 @@ class GlobalHSpecTableGroup:
                     p
                 ].get_prompt_table_data.remote(pid)
         return futures
+
+    # Double-buffer version management
+
+    def swap(self):
+        """Swap building → active on all actors.  **Blocking.**"""
+        if self.groups:
+            ray.get([g.swap.remote() for g in self.groups])
+
+    def swap_async(self) -> List[ray.ObjectRef]:
+        """Queue swap on all actors.  Non-blocking; returns futures."""
+        return [g.swap.remote() for g in self.groups]
+
+    def get_active_version(self) -> int:
+        """Return active table version (queries one actor)."""
+        if not self.groups:
+            return 0
+        return ray.get(self.groups[0].get_active_version.remote())
+
+    def prefetch_batch(
+        self, prompt_ids: List[str],
+    ) -> Dict[str, Optional[Dict]]:
+        """Batch-fetch table data from active tables (for proposer cache).
+
+        One Ray call per partition → minimal overhead.  Returns
+        ``{prompt_id: serialised_table_data | None}``.
+        """
+        from collections import defaultdict
+
+        partition_prompts: Dict[int, List[str]] = defaultdict(list)
+        for pid in prompt_ids:
+            partition_prompts[self._get_partition_id(pid)].append(pid)
+
+        futures: Dict[int, ray.ObjectRef] = {}
+        for p, pids in partition_prompts.items():
+            if p < len(self.groups):
+                futures[p] = self.groups[
+                    p
+                ].get_active_table_data_batch.remote(pids)
+
+        result: Dict[str, Optional[Dict]] = {}
+        latest_version = -1
+        for p, future in futures.items():
+            version, batch_data = ray.get(future)
+            latest_version = max(latest_version, version)
+            result.update(batch_data)
+        return latest_version, result
+
+    def prefetch_batch_async(
+        self, prompt_ids: List[str],
+    ) -> List[Tuple[ray.ObjectRef, List[str]]]:
+        """Fire async prefetch – **non-blocking**, returns immediately.
+
+        Returns ``[(ObjectRef, [prompt_ids]), ...]`` where each
+        ObjectRef resolves to ``(active_version, {pid: data | None})``.
+        Callers should poll with ``ray.wait(timeout=0)`` instead of
+        blocking on ``ray.get()``.
+        """
+        from collections import defaultdict
+
+        partition_prompts: Dict[int, List[str]] = defaultdict(list)
+        for pid in prompt_ids:
+            partition_prompts[self._get_partition_id(pid)].append(pid)
+
+        result: List[Tuple[ray.ObjectRef, List[str]]] = []
+        for p, pids in partition_prompts.items():
+            if p < len(self.groups):
+                future = self.groups[
+                    p
+                ].get_active_table_data_batch.remote(pids)
+                result.append((future, pids))
+        return result
 
     # Management
 
