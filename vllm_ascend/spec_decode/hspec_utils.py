@@ -696,6 +696,87 @@ _hspec_device_buffers: Dict[str, List[torch.Tensor]] = {}
 _hspec_collection_enabled: bool = False
 
 
+# HSpec debug helpers (opt-in)
+# Enable by setting env var HSPEC_DEBUG=1 in Ray workers.
+# We use print() (not logger) so messages appear even when VLLM_LOGGING_LEVEL=WARN.
+import os as _os
+import time as _time
+
+
+def _hspec_debug_enabled() -> bool:
+    try:
+        return bool(int(_os.getenv("HSPEC_DEBUG", "0")))
+    except Exception:
+        return False
+
+
+def _hspec_debug_max_reqs() -> int:
+    try:
+        return int(_os.getenv("HSPEC_DEBUG_MAX_REQS", "2"))
+    except Exception:
+        return 2
+
+
+def _hspec_debug_max_values() -> int:
+    try:
+        return int(_os.getenv("HSPEC_DEBUG_MAX_VALUES", "8"))
+    except Exception:
+        return 8
+
+
+def _hspec_debug_print(msg: str) -> None:
+    print(f"[HSPEC_DEBUG] {msg}", flush=True)
+
+
+def _hspec_preview_np(arr: np.ndarray) -> str:
+    if arr is None:
+        return "None"
+    try:
+        if getattr(arr, "ndim", None) != 2:
+            return f"shape={getattr(arr,'shape',None)} dtype={getattr(arr,'dtype',None)}"
+        L, D = int(arr.shape[0]), int(arr.shape[1])
+        k = min(_hspec_debug_max_values(), D)
+        head = arr[0, :k].astype(np.float32).tolist() if L > 0 else None
+        tail = arr[-1, :k].astype(np.float32).tolist() if L > 0 else None
+        return (f"shape={arr.shape} dtype={arr.dtype} "
+                f"head0[:{k}]={head} tail-1[:{k}]={tail}")
+    except Exception as e:
+        return f"<preview_failed: {type(e).__name__}: {e}>"
+
+
+_hspec_debug_req_ids_seen: set[str] = set()
+_hspec_debug_last_print_ts: float = 0.0
+
+
+def _hspec_debug_should_print_req(req_id: str) -> bool:
+    global _hspec_debug_last_print_ts
+    if not _hspec_debug_enabled():
+        return False
+    if (req_id not in _hspec_debug_req_ids_seen
+            and len(_hspec_debug_req_ids_seen) >= _hspec_debug_max_reqs()):
+        return False
+    now = _time.time()
+    if now - _hspec_debug_last_print_ts < 0.2:
+        return False
+    _hspec_debug_last_print_ts = now
+    _hspec_debug_req_ids_seen.add(req_id)
+    return True
+
+
+# Per-request append counters (for debug only; no device→host sync).
+_hspec_debug_append_counts: Dict[str, int] = {}
+
+
+def _hspec_debug_inc_append(req_id: str) -> int:
+    cnt = _hspec_debug_append_counts.get(req_id, 0) + 1
+    _hspec_debug_append_counts[req_id] = cnt
+    return cnt
+
+
+def _hspec_debug_pop_count(req_id: str) -> int:
+    return _hspec_debug_append_counts.pop(req_id, 0)
+
+
 def hspec_set_collection_enabled(enabled: bool):
     """Enable or disable hidden state collection globally."""
     global _hspec_collection_enabled
@@ -735,6 +816,22 @@ def hspec_append_step_hs(req_id: str, hidden_state: torch.Tensor):
         if req_id not in _hspec_device_buffers:
             _hspec_device_buffers[req_id] = []
         _hspec_device_buffers[req_id].append(hidden_state)
+        # Debug: print metadata only (NO value inspection → no device→host sync).
+        if _hspec_debug_should_print_req(req_id):
+            cnt = _hspec_debug_inc_append(req_id)
+            # Print at steps 1,2,4,8,... to avoid spam.
+            if cnt <= 2 or (cnt & (cnt - 1) == 0):
+                try:
+                    _hspec_debug_print(
+                        "model_runner.append_step"
+                        f" req_id={req_id}"
+                        f" step={cnt}"
+                        f" hs_shape={tuple(hidden_state.shape)}"
+                        f" hs_dtype={hidden_state.dtype}"
+                        f" hs_device={hidden_state.device}"
+                    )
+                except Exception:
+                    pass
 
 
 def hspec_flush_and_get_all() -> Dict[str, np.ndarray]:
@@ -758,6 +855,14 @@ def hspec_flush_and_get_all() -> Dict[str, np.ndarray]:
                 # Single device→host transfer per request
                 cpu_array = stacked.to(dtype=torch.float16).cpu().numpy()
                 result[str(req_id)] = cpu_array
+                if _hspec_debug_should_print_req(str(req_id)):
+                    cnt = _hspec_debug_pop_count(str(req_id))
+                    _hspec_debug_print(
+                        "rollout.flush_request"
+                        f" req_id={req_id}"
+                        f" appended_steps={cnt}"
+                        f" {_hspec_preview_np(cpu_array)}"
+                    )
         _hspec_device_buffers.clear()
         return result
 
@@ -778,7 +883,16 @@ def hspec_pop_request(req_id: str) -> Optional[np.ndarray]:
             tensors = _hspec_device_buffers.pop(req_id)
             if tensors:
                 stacked = torch.stack(tensors)
-                return stacked.to(dtype=torch.float16).cpu().numpy()
+                cpu_array = stacked.to(dtype=torch.float16).cpu().numpy()
+                if _hspec_debug_should_print_req(req_id):
+                    cnt = _hspec_debug_pop_count(req_id)
+                    _hspec_debug_print(
+                        "enginecore.pop_request"
+                        f" req_id={req_id}"
+                        f" appended_steps={cnt}"
+                        f" {_hspec_preview_np(cpu_array)}"
+                    )
+                return cpu_array
         return None
 
 
@@ -789,6 +903,9 @@ def hspec_clear_store():
         for tensors in _hspec_device_buffers.values():
             tensors.clear()
         _hspec_device_buffers.clear()
+        _hspec_debug_append_counts.clear()
+        if _hspec_debug_enabled():
+            _hspec_debug_print("clear_store")
 
 
 class HSpecConfig:
