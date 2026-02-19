@@ -513,6 +513,54 @@ class HSpecTableGroup:
         self._build_count = 0
         self._discard_count = 0
 
+    # Debug
+
+    def debug_table_info(self, prompt_id: str) -> Dict:
+        """Return detailed debug info for a prompt's tables (building + active)."""
+        info: Dict[str, Any] = {
+            "prompt_id": prompt_id,
+            "active_version": self._active_version,
+            "building_prompt_count": len(self._building),
+            "active_prompt_count": len(self._active),
+        }
+        for label, store in [("building", self._building),
+                             ("active", self._active)]:
+            if prompt_id not in store:
+                info[label] = None
+                continue
+            t = store[prompt_id]
+            keys_np = t.get_keys_numpy()
+            # Sample first key for sanity check
+            key_sample = None
+            key_norm_sample = None
+            if t.n_entries > 0 and keys_np.shape[0] > 0:
+                key_sample = keys_np[0][:8].tolist()  # first 8 dims
+                key_norm_sample = float(np.linalg.norm(keys_np[0]))
+            # Sample value (first entry's draft tokens)
+            draft_sample = None
+            if t.n_entries > 0:
+                ridx = int(t.entry_rollout_idx[0])
+                off = int(t.entry_offset[0])
+                seq = t.rollout_seqs[ridx] if ridx < len(t.rollout_seqs) else None
+                if seq is not None:
+                    draft_sample = seq[off: off + min(5, t.wnd_size)].tolist()
+            info[label] = {
+                "n_entries": t.n_entries,
+                "pca_mean_shape": list(t.pca_params.mean.shape),
+                "pca_components_shape": list(t.pca_params.components.shape),
+                "pca_mean_norm": float(np.linalg.norm(t.pca_params.mean)),
+                "keys_shape": list(keys_np.shape),
+                "key_sample_first8": key_sample,
+                "key_norm_sample": key_norm_sample,
+                "rollout_seqs_count": len(t.rollout_seqs),
+                "rollout_seq_lens": [len(s) for s in t.rollout_seqs],
+                "wnd_size": t.wnd_size,
+                "max_wnd": t.max_wnd,
+                "min_wnd": t.min_wnd,
+                "draft_sample_entry0": draft_sample,
+            }
+        return info
+
     # ZMQ server  (for decode hot-loop queries)
 
     def run(self):
@@ -854,6 +902,13 @@ class GlobalHSpecTableGroup:
 
     def delete(self, prompt_id: str):
         return self._get_partition(prompt_id).delete.remote(prompt_id)
+
+    # Debug
+
+    def debug_table_info(self, prompt_id: str) -> Dict:
+        """Query a partition actor for debug info about a prompt's tables."""
+        actor = self._get_partition(prompt_id)
+        return ray.get(actor.debug_table_info.remote(prompt_id))
 
     # Metrics
 
