@@ -1878,6 +1878,27 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     valid_sampled_token_ids, sampling_metadata, scheduler_output,
                     spec_decode_metadata, positions, num_scheduled_tokens,
                     hidden_states, attn_metadata, aux_hidden_states)
+
+        # HSpec debug: one prompt per step – log only the chosen request's draft_token_ids.
+        try:
+            import os as _os
+            if _os.getenv("HSPEC_DEBUG", "0") != "0" and self.drafter is not None \
+                    and self.drafter.name == SpecDcodeType.HSPEC \
+                    and draft_token_ids is not None:
+                from vllm_ascend.spec_decode.hspec_proposer import (
+                    logger as _hspec_logger,
+                    HSPEC_DEBUG_REQ_IDX,
+                )
+                di = min(HSPEC_DEBUG_REQ_IDX, len(draft_token_ids) - 1) if draft_token_ids else 0
+                if di < self.input_batch.num_reqs:
+                    req_id = self.input_batch.req_ids[di]
+                    _hspec_logger.info(
+                        "HSPEC DEBUG propose_draft_token_ids() [req_idx=%d]: req_id=%s draft_token_ids=%s",
+                        di, req_id, draft_token_ids[di],
+                    )
+        except Exception:
+            pass
+
         return draft_token_ids
 
     def _pool(

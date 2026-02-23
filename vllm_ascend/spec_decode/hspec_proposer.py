@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from collections import OrderedDict
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 import torch
@@ -40,6 +40,11 @@ from vllm_ascend.spec_decode.hspec_utils import prompt_id_from_token_ids
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("HSPEC_LOG_LEVEL", os.getenv("VERL_LOGGING_LEVEL", "WARN")))
+
+# Enable verbose HSpec debug logging when HSPEC_DEBUG is set.
+HSPEC_DEBUG = os.getenv("HSPEC_DEBUG", "0") != "0"
+# Per-step debug: only log one request per step to limit log volume.
+HSPEC_DEBUG_REQ_IDX = int(os.getenv("HSPEC_DEBUG_REQ_IDX", "3"))
 
 
 # Worker-local cached prompt table (on-device tensors + CPU refs)
@@ -100,6 +105,118 @@ class _CachedPromptTable:
             self.wnd_size = max(self.wnd_size // 2, self.min_wnd)
 
 
+# Helper function for detokenization (with internal debug when HSPEC_DEBUG=1)
+def _detokenize_safe(tokenizer, token_ids) -> str:
+    """Safely detokenize token_ids to text, returns '<decode_error>' on failure.
+
+    token_ids may be list, numpy array, or contain numpy.int64/torch.Tensor
+    elements; we normalize to list of Python ints so tokenizer.decode() works.
+    """
+    if HSPEC_DEBUG:
+        logger.info(
+            "HSPEC DEBUG _detokenize_safe: tokenizer=%s, token_ids type=%s, len=%s",
+            type(tokenizer).__name__ if tokenizer is not None else "None",
+            type(token_ids).__name__ if token_ids is not None else "None",
+            len(token_ids) if token_ids is not None else 0,
+        )
+    try:
+        if tokenizer is None:
+            if HSPEC_DEBUG:
+                logger.info("HSPEC DEBUG _detokenize_safe: early return <no_tokenizer>")
+            return "<no_tokenizer>"
+        if token_ids is None:
+            return "<empty>"
+        # Flatten and coerce to Python ints (handles list, ndarray, and
+        # elements that are numpy.int64 or torch.Tensor scalars)
+        if isinstance(token_ids, np.ndarray):
+            token_ids = token_ids.tolist()
+        ids = []
+        for x in token_ids:
+            if hasattr(x, "item"):
+                ids.append(int(x.item()))
+            else:
+                ids.append(int(x))
+        if not ids:
+            return "<empty>"
+        text = tokenizer.decode(ids, skip_special_tokens=False)
+        if HSPEC_DEBUG:
+            logger.info("HSPEC DEBUG _detokenize_safe: decode ok len(text)=%d", len(text))
+        return text
+    except Exception as e:
+        import traceback
+        n = len(token_ids) if token_ids is not None else 0
+        if HSPEC_DEBUG:
+            logger.info(
+                "HSPEC DEBUG _detokenize_safe: EXCEPTION %s: %s\n%s",
+                type(e).__name__, e, traceback.format_exc(),
+            )
+        return f"<decode_error: {n} tokens, {type(e).__name__}: {e}>"
+
+
+# Cache for tokenizer loaded from name/path (model_config.tokenizer is str in vLLM)
+_tokenizer_cache: Dict[str, Any] = {}
+
+
+def _get_tokenizer_safe(runner) -> Optional[Any]:
+    """Safely get tokenizer from runner/model/config.
+
+    vLLM's model_config.tokenizer is often a string (model name/path), not an
+    instance. When we get a str, we load via AutoTokenizer.from_pretrained(...)
+    and cache by that path so decode works in debug.
+    """
+    global _tokenizer_cache
+    if HSPEC_DEBUG:
+        logger.info(
+            "HSPEC DEBUG _get_tokenizer_safe: runner=%s, has model=%s, has vllm_config=%s, has tokenizer=%s",
+            type(runner).__name__,
+            hasattr(runner, "model"),
+            hasattr(runner, "vllm_config"),
+            hasattr(runner, "tokenizer"),
+        )
+    try:
+        if hasattr(runner, "model") and runner.model is not None:
+            if hasattr(runner.model, "tokenizer"):
+                t = runner.model.tokenizer
+                if not isinstance(t, str):
+                    if HSPEC_DEBUG:
+                        logger.info("HSPEC DEBUG _get_tokenizer_safe: got tokenizer from runner.model.tokenizer type=%s", type(t).__name__)
+                    return t
+        if hasattr(runner, "vllm_config") and runner.vllm_config is not None:
+            mc = getattr(runner.vllm_config, "model_config", None)
+            if mc is not None and hasattr(mc, "tokenizer"):
+                t = mc.tokenizer
+                if isinstance(t, str):
+                    # model_config.tokenizer is the tokenizer name/path; load and cache
+                    if t not in _tokenizer_cache:
+                        try:
+                            from transformers import AutoTokenizer
+                            _tokenizer_cache[t] = AutoTokenizer.from_pretrained(t, trust_remote_code=True)
+                        except Exception as load_err:
+                            if HSPEC_DEBUG:
+                                logger.warning("HSPEC DEBUG _get_tokenizer_safe: AutoTokenizer.from_pretrained(%r) failed: %s", t, load_err)
+                            return None
+                    t = _tokenizer_cache[t]
+                if HSPEC_DEBUG:
+                    logger.info("HSPEC DEBUG _get_tokenizer_safe: got tokenizer from vllm_config.model_config.tokenizer type=%s", type(t).__name__)
+                return t    # right exit point
+        if hasattr(runner, "tokenizer"):
+            t = runner.tokenizer
+            if not isinstance(t, str):
+                if HSPEC_DEBUG:
+                    logger.info("HSPEC DEBUG _get_tokenizer_safe: got tokenizer from runner.tokenizer type=%s", type(t).__name__)
+                return t
+        if HSPEC_DEBUG:
+            logger.info("HSPEC DEBUG _get_tokenizer_safe: no tokenizer found, returning None")
+        return None
+    except Exception as e:
+        import traceback
+        if HSPEC_DEBUG:
+            logger.info(
+                "HSPEC DEBUG _get_tokenizer_safe: EXCEPTION %s: %s\n%s",
+                type(e).__name__, e, traceback.format_exc(),
+            )
+        return None
+
 # Main proposer
 
 class HSpecProposer(Proposer):
@@ -122,7 +239,7 @@ class HSpecProposer(Proposer):
         self.name = SpecDcodeType.HSPEC
         self.device = device
         self.runner = runner
-
+        
         spec_config = vllm_config.speculative_config
         self.max_draft_tokens: int = spec_config.num_speculative_tokens
         self.similarity_threshold: float = getattr(
@@ -207,8 +324,7 @@ class HSpecProposer(Proposer):
         """Non-blocking: consume any ready prefetch futures.
 
         Uses ``ray.wait(timeout=0)`` which returns immediately with
-        whatever futures are already completed – typically ~1 µs Python
-        overhead, zero network I/O.
+        whatever futures are already completed.
         """
         if not self._pending_fetches:
             return
@@ -425,7 +541,7 @@ class HSpecProposer(Proposer):
         return None
 
     # main interface
-
+    
     def generate_token_ids(
         self,
         valid_sampled_token_ids: List[List[int]],
@@ -455,7 +571,6 @@ class HSpecProposer(Proposer):
             return []
         if hidden_states is None:
             return [[] for _ in range(batch_size)]
-
         input_batch = self.runner.input_batch
 
         # 1. Stable prompt_id + anchor hidden state per request
@@ -480,6 +595,50 @@ class HSpecProposer(Proposer):
                 spec_decode_metadata,
             )
             anchor_list.append(hs)
+
+        if HSPEC_DEBUG:
+            # (1)(2) One prompt per step: only the chosen request
+            try:
+                di = min(HSPEC_DEBUG_REQ_IDX, batch_size - 1) if batch_size else 0
+                req_id = input_batch.req_ids[di]
+                req_state = self.runner.requests.get(req_id)
+                if req_state is None:
+                    decoded_tokens = []
+                    prompt_tokens = []
+                else:
+                    decoded_tokens = list(getattr(req_state, "output_token_ids", []))
+                    prompt_tokens = list(getattr(req_state, "prompt_token_ids", []))
+                anchor_hs_summary = "anchor_hs=None"
+                if di < len(anchor_list) and anchor_list[di] is not None:
+                    hs = anchor_list[di]
+                    try:
+                        norm = float(hs.float().norm().item())
+                    except Exception:
+                        norm = float("nan")
+                    anchor_hs_summary = (
+                        f"anchor_hs.shape={tuple(hs.shape)} norm={norm:.6f} device={hs.device}"
+                    )
+                # Detokenize prompt_tokens + decoded_tokens
+                tokenizer = _get_tokenizer_safe(self.runner)
+                prompt_decoded_text = _detokenize_safe(tokenizer, prompt_tokens + decoded_tokens)
+                logger.info(
+                    "HSPEC DEBUG generate_token_ids() [req_idx=%d]: "
+                    "hidden_states.shape=%s dtype=%s device=%s | "
+                    "prompt_id=%s prompt_tokens=%s \n decoded_tokens=%s accepted_step_tokens=%s | "
+                    "prompt+decoded_text=%r | %s",
+                    di,
+                    tuple(hidden_states.shape),
+                    str(hidden_states.dtype),
+                    hidden_states.device,
+                    prompt_ids[di] if di < len(prompt_ids) else "",
+                    prompt_tokens,
+                    decoded_tokens,
+                    valid_sampled_token_ids[di] if di < len(valid_sampled_token_ids) else [],
+                    prompt_decoded_text,
+                    anchor_hs_summary,
+                )
+            except Exception:
+                logger.exception("HSPEC DEBUG: failed to log prompt/hidden_state info")
 
         # 2. Consume ready prefetch futures (non-blocking).
         # prefetch_for_batch() was already called before the forward pass.
@@ -520,7 +679,83 @@ class HSpecProposer(Proposer):
 
             pending.append((i, best_sim, best_idx, cached))
 
+        if HSPEC_DEBUG:
+            try:
+                di = min(HSPEC_DEBUG_REQ_IDX, batch_size - 1) if batch_size else 0
+                # Pending list: only the chosen request if it is in pending
+                pending_line = None
+                cached_for_debug = None
+                for (i, sim_t, idx_t, cached) in pending:
+                    if i != di:
+                        continue
+                    cached_for_debug = cached
+                    try:
+                        sim_val = float(sim_t.detach().float().item())
+                    except Exception:
+                        sim_val = float("nan")
+                    try:
+                        best_idx_val = int(idx_t.detach().item())
+                    except Exception:
+                        best_idx_val = -1
+                    pending_line = (
+                        f"pending [req_idx={di}] prompt_id={prompt_ids[di]!r} "
+                        f"sim={sim_val:.6f} best_idx={best_idx_val} n_entries={cached.n_entries}"
+                    )
+                    break
+                if pending_line is None:
+                    pending_line = (
+                        f"pending: req_idx={di} not in pending (pending_size=%d)"
+                        % len(pending)
+                    )
+                else:
+                    # (1) Print cache table contents (all entries)
+                    if cached_for_debug is not None:
+                        table_info_lines = []
+                        n_entries = cached_for_debug.n_entries
+                        table_info_lines.append(
+                            f"cache_table[pid={prompt_ids[di]!r}] n_entries={n_entries} "
+                            f"wnd_size={cached_for_debug.wnd_size} "
+                            f"mean.shape={tuple(cached_for_debug.mean.shape)} "
+                            f"components.shape={tuple(cached_for_debug.components.shape)} "
+                            f"keys.shape={tuple(cached_for_debug.keys.shape)}"
+                        )
+                        # Print all entries
+                        tokenizer = _get_tokenizer_safe(self.runner)
+                        for entry_idx in range(n_entries):
+                            ridx = int(cached_for_debug.entry_rollout_idx[entry_idx])
+                            off = int(cached_for_debug.entry_offset[entry_idx])
+                            seq = cached_for_debug.rollout_seqs[ridx]
+                            draft_tokens = seq[off: off + cached_for_debug.wnd_size].tolist()
+                            # Detokenize rollout sequence
+                            rollout_text = _detokenize_safe(tokenizer, draft_tokens)
+                            # Get similarity for this entry (if keys available)
+                            try:
+                                # Use the projected anchor_hs to compute similarity
+                                if di < len(anchor_list) and anchor_list[di] is not None:
+                                    hs_f = anchor_list[di].float()
+                                    z = (hs_f - cached_for_debug.mean) @ cached_for_debug.components.T
+                                    z = F.normalize(z, dim=0)
+                                    entry_sim = float((cached_for_debug.keys[entry_idx] @ z).item())
+                                else:
+                                    entry_sim = float("nan")
+                            except Exception:
+                                entry_sim = float("nan")
+                            table_info_lines.append(
+                                f"  entry[{entry_idx}]: rollout_idx={ridx} offset={off} "
+                                f"sim={entry_sim:.4f} draft_tokens={draft_tokens} "
+                                f"rollout_text={rollout_text!r}"
+                            )
+                        pending_line += "\n" + "\n".join(table_info_lines)
+                logger.info(
+                    "HSPEC DEBUG generate_token_ids() [req_idx=%d]: %s",
+                    di, pending_line,
+                )
+            except Exception:
+                logger.exception("HSPEC DEBUG: failed to log pending list")
+
         if not pending:
+            if HSPEC_DEBUG:
+                logger.info("HSPEC DEBUG generate_token_ids(): no pending entries, all requests miss cache/anchor")
             return results
 
         # 4. Single device → host sync for the whole batch
@@ -551,6 +786,33 @@ class HSpecProposer(Proposer):
 
         self._stat_queries += len(pending)
         self._maybe_log_metrics()
+
+        if HSPEC_DEBUG:
+            try:
+                di = min(HSPEC_DEBUG_REQ_IDX, batch_size - 1) if batch_size else 0
+                # Matched + draft for chosen request only
+                matched_line = None
+                for j, (i, _, _, cached) in enumerate(pending):
+                    if i != di or sims_cpu[j] < self.similarity_threshold:
+                        continue
+                    matched_line = (
+                        f"matched [req_idx={di}] prompt_id={prompt_ids[di]!r} "
+                        f"sim={float(sims_cpu[j]):.4f} best_idx={int(idxs_cpu[j])} "
+                        f"wnd_size={cached.wnd_size} draft_tokens={list(results[di])}"
+                    )
+                    break
+                if matched_line is None:
+                    matched_line = (
+                        f"matched: req_idx={di} not above threshold (threshold=%.4f) or not in pending"
+                        % self.similarity_threshold
+                    )
+                logger.info(
+                    "HSPEC DEBUG generate_token_ids() [req_idx=%d]: %s | final draft_token_ids=%s",
+                    di, matched_line, results[di] if di < len(results) else [],
+                )
+            except Exception:
+                logger.exception("HSPEC DEBUG: failed to log draft / match info")
+
         return results
 
     # bookkeeping
@@ -563,7 +825,7 @@ class HSpecProposer(Proposer):
             self._accept_lengths[rid] = al
             self._stat_accept_sum += int(al)
             self._stat_accept_count += 1
-
+    
     def clear_request(self, req_id: str):
         """Clear per-request state on completion."""
         self._accept_lengths.pop(req_id, None)
