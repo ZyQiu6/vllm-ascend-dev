@@ -1896,6 +1896,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         "HSPEC DEBUG propose_draft_token_ids() [req_idx=%d]: req_id=%s draft_token_ids=%s",
                         di, req_id, draft_token_ids[di],
                     )
+                    _hspec_logger.info(
+                         "------------------------------------------- propose_draft_token_ids() end -------------------------------------------\n"
+                    )
         except Exception:
             pass
 

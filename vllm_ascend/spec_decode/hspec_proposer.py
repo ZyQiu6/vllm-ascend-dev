@@ -112,13 +112,13 @@ def _detokenize_safe(tokenizer, token_ids) -> str:
     token_ids may be list, numpy array, or contain numpy.int64/torch.Tensor
     elements; we normalize to list of Python ints so tokenizer.decode() works.
     """
-    if HSPEC_DEBUG:
-        logger.info(
-            "HSPEC DEBUG _detokenize_safe: tokenizer=%s, token_ids type=%s, len=%s",
-            type(tokenizer).__name__ if tokenizer is not None else "None",
-            type(token_ids).__name__ if token_ids is not None else "None",
-            len(token_ids) if token_ids is not None else 0,
-        )
+    # if HSPEC_DEBUG:
+    #     logger.info(
+    #         "HSPEC DEBUG _detokenize_safe: tokenizer=%s, token_ids type=%s, len=%s",
+    #         type(tokenizer).__name__ if tokenizer is not None else "None",
+    #         type(token_ids).__name__ if token_ids is not None else "None",
+    #         len(token_ids) if token_ids is not None else 0,
+    #     )
     try:
         if tokenizer is None:
             if HSPEC_DEBUG:
@@ -139,8 +139,8 @@ def _detokenize_safe(tokenizer, token_ids) -> str:
         if not ids:
             return "<empty>"
         text = tokenizer.decode(ids, skip_special_tokens=False)
-        if HSPEC_DEBUG:
-            logger.info("HSPEC DEBUG _detokenize_safe: decode ok len(text)=%d", len(text))
+        # if HSPEC_DEBUG:
+        #     logger.info("HSPEC DEBUG _detokenize_safe: decode ok len(text)=%d", len(text))
         return text
     except Exception as e:
         import traceback
@@ -622,6 +622,7 @@ class HSpecProposer(Proposer):
                 tokenizer = _get_tokenizer_safe(self.runner)
                 prompt_decoded_text = _detokenize_safe(tokenizer, prompt_tokens + decoded_tokens)
                 logger.info(
+                    "------------------------------------------- generate_token_ids() begin -------------------------------------------\n"
                     "HSPEC DEBUG generate_token_ids() [req_idx=%d]: "
                     "hidden_states.shape=%s dtype=%s device=%s | "
                     "prompt_id=%s prompt_tokens=%s \n decoded_tokens=%s accepted_step_tokens=%s | "
@@ -671,7 +672,7 @@ class HSpecProposer(Proposer):
             z = (hs_f - cached.mean) @ cached.components.T
 
             # L2 normalise
-            z = F.normalize(z, dim=0)
+            # z = F.normalize(z, dim=0)
 
             # Cosine similarity with all stored keys
             sims = cached.keys @ z          # (n_entries,)
@@ -734,7 +735,7 @@ class HSpecProposer(Proposer):
                                 if di < len(anchor_list) and anchor_list[di] is not None:
                                     hs_f = anchor_list[di].float()
                                     z = (hs_f - cached_for_debug.mean) @ cached_for_debug.components.T
-                                    z = F.normalize(z, dim=0)
+                                    # z = F.normalize(z, dim=0)
                                     entry_sim = float((cached_for_debug.keys[entry_idx] @ z).item())
                                 else:
                                     entry_sim = float("nan")
@@ -809,6 +810,9 @@ class HSpecProposer(Proposer):
                 logger.info(
                     "HSPEC DEBUG generate_token_ids() [req_idx=%d]: %s | final draft_token_ids=%s",
                     di, matched_line, results[di] if di < len(results) else [],
+                )
+                logger.info(
+                    "------------------------------------------- generate_token_ids() end -------------------------------------------\n"
                 )
             except Exception:
                 logger.exception("HSPEC DEBUG: failed to log draft / match info")

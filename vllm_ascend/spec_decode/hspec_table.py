@@ -110,9 +110,9 @@ class PromptTableData:
 
         # L2-normalise projected keys for cosine similarity
         kf = projected_keys[:n_add].astype(np.float32, copy=False)
-        norms = np.linalg.norm(kf, axis=1, keepdims=True)
-        np.maximum(norms, 1e-8, out=norms)
-        kf /= norms
+        # norms = np.linalg.norm(kf, axis=1, keepdims=True)
+        # np.maximum(norms, 1e-8, out=norms)
+        # kf /= norms
 
         s = self.n_entries
         e = s + n_add
