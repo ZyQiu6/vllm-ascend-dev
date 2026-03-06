@@ -283,6 +283,14 @@ class HSpecProposer(Proposer):
         self._log_every_calls = int(os.environ.get("HSPEC_LOG_EVERY_CALLS", "200"))
         self._log_every_s = float(os.environ.get("HSPEC_LOG_EVERY_S", "10"))
 
+        # Low-frequency metrics reporting to table actors (so trainer-side
+        # hspec_tables.compute_metrics() reflects worker-local online queries).
+        self._report_every_calls = int(os.environ.get("HSPEC_REPORT_EVERY_CALLS", "200"))
+        self._last_report_calls = 0
+        self._reported_queries = 0
+        self._reported_hits = 0
+        self._reported_total_draft_len = 0
+
         logger.info(
             "HSpec proposer initialised: threshold=%.3f, "
             "max_draft=%d, cache_cap=%d",
@@ -454,6 +462,35 @@ class HSpecProposer(Proposer):
             int(self._stat_prefetch_ready),
             int(self._cache_version),
         )
+
+        # Also report stats to the global table group at low frequency so the
+        # trainer can observe match_rate/avg_draft_len even when queries are
+        # executed locally on the worker.
+        self._maybe_report_metrics()
+
+    def _maybe_report_metrics(self) -> None:
+        """Non-blocking metrics reporting (fire-and-forget Ray RPC)."""
+        if self._stat_calls - self._last_report_calls < self._report_every_calls:
+            return
+        self._last_report_calls = self._stat_calls
+
+        dq = int(self._stat_queries - self._reported_queries)
+        dh = int(self._stat_hits - self._reported_hits)
+        ddl = int(self._stat_total_draft_len - self._reported_total_draft_len)
+        if dq <= 0 and dh <= 0 and ddl <= 0:
+            return
+
+        self._reported_queries = int(self._stat_queries)
+        self._reported_hits = int(self._stat_hits)
+        self._reported_total_draft_len = int(self._stat_total_draft_len)
+
+        try:
+            # Fire-and-forget, never block the hot loop.
+            if hasattr(self.hspec_tables, "report_online_metrics_async"):
+                self.hspec_tables.report_online_metrics_async(dq, dh, ddl)
+        except Exception:
+            # Swallow all errors; metrics must never affect decoding.
+            pass
 
     def _build_cached_table(self, data: dict) -> _CachedPromptTable:
         """Convert serialised table data dict → on-device cached table."""

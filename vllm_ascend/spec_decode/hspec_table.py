@@ -237,6 +237,14 @@ class HSpecTableGroup:
         self._total_draft_len = 0
         self._build_count = 0
         self._discard_count = 0
+        # Verification metrics (post rejection-sampling)
+        # verify_times: number of requests that entered verification with a
+        # non-empty draft (i.e., spec decode attempted).
+        # accept_times: number of those requests whose accepted prefix length >= 1.
+        # accept_length_sum: sum(accepted_prefix_len) over accept_times.
+        self._verify_count = 0
+        self._accept_count = 0
+        self._accept_len_sum = 0
 
         # ZMQ state
         self.running = False
@@ -500,6 +508,9 @@ class HSpecTableGroup:
             "query_times": self._query_count,
             "match_times": self._match_count,
             "total_draft_length": self._total_draft_len,
+            "verify_times": self._verify_count,
+            "accept_times": self._accept_count,
+            "accept_length_sum": self._accept_len_sum,
             "build_count": self._build_count,
             "discard_count": self._discard_count,
             "num_prompts": len(self._active),
@@ -512,6 +523,51 @@ class HSpecTableGroup:
         self._total_draft_len = 0
         self._build_count = 0
         self._discard_count = 0
+        self._verify_count = 0
+        self._accept_count = 0
+        self._accept_len_sum = 0
+
+    # Online metrics reporting (from worker-local proposer)
+
+    def report_online_metrics(
+        self,
+        query_times: int = 0,
+        match_times: int = 0,
+        total_draft_length: int = 0,
+    ) -> None:
+        """Accumulate online query stats reported by worker-local proposers.
+
+        In HSPEC's fast path, similarity matching is executed entirely on the
+        vLLM worker (device + local cache) and does not call the table actor's
+        query methods. Therefore, actor-side query counters would remain zero
+        unless we explicitly report these stats.
+
+        Callers should invoke this at low frequency to avoid overhead.
+        """
+        try:
+            self._query_count += int(query_times)
+            self._match_count += int(match_times)
+            self._total_draft_len += int(total_draft_length)
+        except Exception:
+            pass
+
+    def report_verification_metrics(
+        self,
+        verify_times: int = 0,
+        accept_times: int = 0,
+        accept_length_sum: int = 0,
+    ) -> None:
+        """Accumulate post-verification stats (after rejection sampling).
+
+        These are reported from the vLLM worker hot loop. Callers should never
+        block on ray.get.
+        """
+        try:
+            self._verify_count += int(verify_times)
+            self._accept_count += int(accept_times)
+            self._accept_len_sum += int(accept_length_sum)
+        except Exception:
+            pass
 
     # Debug
 
@@ -667,6 +723,52 @@ class GlobalHSpecTableGroup:
 
     def _get_partition(self, prompt_id: str) -> ray.actor.ActorHandle:
         return self.groups[self._get_partition_id(prompt_id)]
+
+    # Online metrics reporting (worker-local fast path)
+
+    def report_online_metrics_async(
+        self,
+        query_times: int,
+        match_times: int,
+        total_draft_length: int,
+    ) -> Optional[ray.ObjectRef]:
+        """Fire-and-forget reporting of online query stats.
+
+        We intentionally do NOT block (no ray.get) to keep this off the hot
+        decode loop. The stats are aggregated into existing actor-side counters
+        so trainer-side `compute_metrics()` can reflect the true online match
+        rate even when queries are executed locally on the worker.
+        """
+        if not self.groups:
+            return None
+        # Aggregate into a single actor to minimize overhead.
+        try:
+            return self.groups[0].report_online_metrics.remote(
+                query_times=query_times,
+                match_times=match_times,
+                total_draft_length=total_draft_length,
+            )
+        except Exception:
+            return None
+
+    def report_verification_metrics_async(
+        self,
+        verify_times: int,
+        accept_times: int,
+        accept_length_sum: int,
+    ) -> Optional[ray.ObjectRef]:
+        """Fire-and-forget reporting of verification stats from vLLM workers."""
+        if not self.groups:
+            return None
+        # Aggregate into a single actor to minimize overhead.
+        try:
+            return self.groups[0].report_verification_metrics.remote(
+                verify_times=verify_times,
+                accept_times=accept_times,
+                accept_length_sum=accept_length_sum,
+            )
+        except Exception:
+            return None
 
     # Build  (async, non-blocking)
 
@@ -918,8 +1020,14 @@ class GlobalHSpecTableGroup:
             return {
                 "hspec/match_rate": 0.0,
                 "hspec/avg_draft_length": 0.0,
+                "hspec/avg_accept_length": 0.0,
                 "hspec/query_times": 0,
                 "hspec/match_times": 0,
+                "hspec/verify_times": 0,
+                "hspec/accept_times": 0,
+                "hspec/cache_match_rate": 0.0,
+                "hspec/cache_query_times": 0,
+                "hspec/cache_match_times": 0,
                 "hspec/build_count": 0,
                 "hspec/discard_count": 0,
                 "hspec/num_prompts": 0,
@@ -932,14 +1040,29 @@ class GlobalHSpecTableGroup:
         for key in metrics_list[0]:
             agg[key] = sum(float(m[key]) for m in metrics_list)
 
-        qt = agg.get("query_times", 0)
-        mt = agg.get("match_times", 0)
+        # Cache-match metrics (reported from worker-local proposer).
+        cache_qt = agg.get("query_times", 0)
+        cache_mt = agg.get("match_times", 0)
         tdl = agg.get("total_draft_length", 0)
+        # Post-verification metrics (reported from model_runner after rejection).
+        vt = agg.get("verify_times", 0)
+        at = agg.get("accept_times", 0)
+        als = agg.get("accept_length_sum", 0)
         return {
-            "hspec/match_rate": mt / qt if qt > 0 else 0.0,
-            "hspec/avg_draft_length": tdl / mt if mt > 0 else 0.0,
-            "hspec/query_times": qt,
-            "hspec/match_times": mt,
+            # User-intended definition: accept_len>=1 probability after rejection sampling.
+            "hspec/match_rate": at / vt if vt > 0 else 0.0,
+            "hspec/avg_accept_length": als / at if at > 0 else 0.0,
+            # Keep legacy key names but align them to verification semantics.
+            "hspec/query_times": vt,
+            "hspec/match_times": at,
+            # Explicit counters.
+            "hspec/verify_times": vt,
+            "hspec/accept_times": at,
+            # Cache-hit metrics kept for debugging/ablation.
+            "hspec/cache_match_rate": cache_mt / cache_qt if cache_qt > 0 else 0.0,
+            "hspec/cache_query_times": cache_qt,
+            "hspec/cache_match_times": cache_mt,
+            "hspec/avg_draft_length": tdl / cache_mt if cache_mt > 0 else 0.0,
             "hspec/build_count": agg.get("build_count", 0),
             "hspec/discard_count": agg.get("discard_count", 0),
             "hspec/num_prompts": agg.get("num_prompts", 0),

@@ -406,6 +406,21 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             logger.info("HSpec: anchor hidden-state collection enabled "
                         "in model_runner")
 
+        # HSpec: verification (post rejection-sampling) metrics reporting.
+        # These metrics implement trainer-intended definitions:
+        # - hspec/match_rate := P(accepted_draft_prefix_len >= 1 | verification attempted)
+        # - hspec/avg_accept_length := E[accepted_draft_prefix_len | accepted_draft_prefix_len >= 1]
+        self._hspec_verify_metrics_enabled = (
+            os.environ.get("HSPEC_VERIFY_METRICS", "1") != "0"
+        )
+        self._hspec_verify_report_every_calls = int(
+            os.environ.get("HSPEC_VERIFY_REPORT_EVERY_CALLS", "50")
+        )
+        self._hspec_verify_stat_calls = 0
+        self._hspec_verify_pending_verify = 0
+        self._hspec_verify_pending_accept = 0
+        self._hspec_verify_pending_accept_len_sum = 0
+
         # kv role
         self.is_kv_producer = False
         self.is_kv_consumer = False
@@ -588,6 +603,55 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                                      dtype=torch.int64)
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs,
                                                   dtype=torch.int32)
+
+    def _hspec_maybe_report_verification_metrics(
+        self,
+        verify_times: int,
+        accept_times: int,
+        accept_length_sum: int,
+    ) -> None:
+        """Best-effort, low-frequency metrics reporting (never block hot loop)."""
+        if not self._hspec_verify_metrics_enabled:
+            return
+        if verify_times <= 0 and accept_times <= 0 and accept_length_sum <= 0:
+            return
+        # Only meaningful for HSPEC.
+        if not self._hspec_collect:
+            return
+
+        self._hspec_verify_stat_calls += 1
+        self._hspec_verify_pending_verify += int(verify_times)
+        self._hspec_verify_pending_accept += int(accept_times)
+        self._hspec_verify_pending_accept_len_sum += int(accept_length_sum)
+
+        if self._hspec_verify_report_every_calls <= 1:
+            should_flush = True
+        else:
+            should_flush = (
+                self._hspec_verify_stat_calls % self._hspec_verify_report_every_calls
+                == 0
+            )
+        if not should_flush:
+            return
+
+        vt = int(self._hspec_verify_pending_verify)
+        at = int(self._hspec_verify_pending_accept)
+        als = int(self._hspec_verify_pending_accept_len_sum)
+        if vt <= 0 and at <= 0 and als <= 0:
+            return
+
+        # Report to the same global table group used by the HSPEC proposer.
+        tables = getattr(self.drafter, "hspec_tables", None)
+        if tables is None or not hasattr(tables, "report_verification_metrics_async"):
+            return
+        try:
+            tables.report_verification_metrics_async(vt, at, als)
+            self._hspec_verify_pending_verify = 0
+            self._hspec_verify_pending_accept = 0
+            self._hspec_verify_pending_accept_len_sum = 0
+        except Exception:
+            # Swallow all errors; metrics must never affect decoding.
+            pass
 
     def _may_pad_kv_consumer_num_seq(self):
         # For Full Graph + MTP in a PD (Prefill/Decode) disaggregation scenario,
@@ -2396,6 +2460,38 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         sampled_token_ids,
                         self.input_batch.vocab_size,
                     )
+
+                # HSpec verification metrics (post rejection-sampling).
+                # We compute on CPU lists (valid_sampled_token_ids) to avoid
+                # introducing extra device sync.
+                if (self._hspec_collect and self._hspec_verify_metrics_enabled
+                        and spec_decode_metadata is not None
+                        and max_gen_len > 1):
+                    try:
+                        scheduled = scheduler_output.scheduled_spec_decode_tokens
+                        verify_add = 0
+                        accept_add = 0
+                        accept_len_add = 0
+                        for i, req_id in enumerate(self.input_batch.req_ids):
+                            draft = scheduled.get(req_id, [])
+                            if not draft:
+                                continue
+                            verify_add += 1
+                            out = (valid_sampled_token_ids[i]
+                                   if i < len(valid_sampled_token_ids) else [])
+                            accepted = 0
+                            for p in range(min(len(draft), len(out))):
+                                if int(out[p]) == int(draft[p]):
+                                    accepted += 1
+                                else:
+                                    break
+                            if accepted >= 1:
+                                accept_add += 1
+                                accept_len_add += int(accepted)
+                        self._hspec_maybe_report_verification_metrics(
+                            verify_add, accept_add, accept_len_add)
+                    except Exception:
+                        pass
                 # Mask out the sampled tokens that should not be sampled.
                 for i in discard_sampled_tokens_req_indices:
                     valid_sampled_token_ids[i].clear()
