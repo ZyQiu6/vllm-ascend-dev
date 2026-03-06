@@ -21,6 +21,7 @@ import copy
 import gc
 import itertools
 import math
+import os
 import re
 import time
 from collections import defaultdict
@@ -146,6 +147,44 @@ import torch_npu
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
+
+
+# HSpec tracing helpers (aligned with HSPEC DEBUG req_idx)
+def _hspec_trace_req_idx() -> int:
+    """Pick the same req_idx as HSPEC DEBUG so logs align to the same prompt."""
+    try:
+        from vllm_ascend.spec_decode.hspec_proposer import HSPEC_DEBUG_REQ_IDX
+        return int(HSPEC_DEBUG_REQ_IDX)
+    except Exception:
+        return int(os.getenv("HSPEC_DEBUG_REQ_IDX", "3"))
+
+
+def _hspec_trace_enabled() -> bool:
+    """Enable extra trace logs when HSPEC_TRACE=1 or HSPEC_DEBUG=1 is set."""
+    return (os.getenv("HSPEC_TRACE", "0") != "0"
+            or os.getenv("HSPEC_DEBUG", "0") != "0")
+
+
+def _hspec_trace_banner(logger) -> None:
+    """Print a one-time banner so we can confirm trace code is actually running."""
+    if not _hspec_trace_enabled():
+        return
+    key = "_HSPEC_TRACE_BANNER_PRINTED"
+    if os.getenv(key, "0") != "0":
+        return
+    os.environ[key] = "1"
+    try:
+        logger.warning(
+            "HSPEC TRACE banner: enabled=1 file=%s pid=%s req_idx=%d HSPEC_DEBUG=%s HSPEC_TRACE=%s",
+            __file__,
+            str(os.getpid()),
+            int(_hspec_trace_req_idx()),
+            os.getenv("HSPEC_DEBUG", ""),
+            os.getenv("HSPEC_TRACE", ""),
+        )
+    except Exception:
+        # Never fail the model runner because of debug logging.
+        pass
 
 if is_310p():
     torch_npu.npu.set_compile_mode(jit_compile=False)
@@ -773,6 +812,22 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     req_index, start_index:end_token_index] = spec_token_ids
                 # NOTE(woosuk): `num_tokens` here may include spec tokens.
                 self.input_batch.num_tokens[req_index] += num_spec_tokens
+                if _hspec_trace_enabled():
+                    di = min(_hspec_trace_req_idx(), self.input_batch.num_reqs - 1) \
+                        if self.input_batch.num_reqs > 0 else 0
+                    trace_req_id = self.input_batch.req_ids[di] if di < self.input_batch.num_reqs else None
+                else:
+                    trace_req_id = None
+                if trace_req_id is not None and str(req_id) == str(trace_req_id):
+                    logger.warning(
+                        "HSPEC TRACE model_runner._update_persistent_batch: "
+                        "req_id=%s req_idx=%d append_spec_tokens start=%d end=%d spec_token_ids=%s",
+                        str(req_id),
+                        int(req_index),
+                        int(start_index),
+                        int(end_token_index),
+                        list(spec_token_ids),
+                    )
 
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
@@ -1460,6 +1515,25 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.num_draft_tokens.np[num_reqs:].fill(0)
             self.num_draft_tokens.copy_to_gpu()
 
+        # HSPEC TRACE: show whether this step is actually running spec-verify
+        # (i.e., scheduler_output has scheduled spec tokens).
+        if _hspec_trace_enabled() and self.input_batch.num_reqs > 0:
+            di = min(_hspec_trace_req_idx(), self.input_batch.num_reqs - 1)
+            try:
+                trace_req_id = self.input_batch.req_ids[di]
+                scheduled = scheduler_output.scheduled_spec_decode_tokens.get(trace_req_id, [])
+                logger.warning(
+                    "HSPEC TRACE prepare_inputs [req_idx=%d]: req_id=%s use_spec_decode=%s "
+                    "scheduled_spec_tokens=%s (len=%d)",
+                    int(di),
+                    str(trace_req_id),
+                    str(bool(use_spec_decode)),
+                    list(scheduled),
+                    int(len(scheduled)),
+                )
+            except Exception:
+                pass
+
         # Used in the below loop.
         # query_start_loc_cpu = self.query_start_loc.cpu[:num_reqs + 1]
         num_computed_tokens_cpu = (
@@ -1674,10 +1748,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         # Compute the draft logits indices.
         # [3, 3, 5, 5, 6]
-        cu_num_draft_tokens = np.cumsum(num_draft_tokens, dtype=np.int32)
-        total_num_draft_tokens = cu_num_draft_tokens[-1]
+        cu_num_draft_tokens_np = np.cumsum(num_draft_tokens, dtype=np.int32)
+        total_num_draft_tokens = cu_num_draft_tokens_np[-1]
         # [0, 0, 0, 3, 3, 5]
-        cumsums_offsets = np.repeat(cu_num_draft_tokens - num_draft_tokens,
+        cumsums_offsets = np.repeat(cu_num_draft_tokens_np - num_draft_tokens,
                                     num_draft_tokens)
         # [0, 1, 2, 0, 1, 0]
         arange = self.arange_np[:total_num_draft_tokens] - cumsums_offsets
@@ -1688,7 +1762,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         target_logits_indices += arange
 
         # TODO: Optimize the CPU -> NPU copy.
-        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(
+        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens_np).to(
             self.device, non_blocking=True)
         logits_indices = torch.from_numpy(logits_indices).to(self.device,
                                                              non_blocking=True)
@@ -1701,6 +1775,30 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
         draft_token_ids = self.input_ids[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
+
+        # HSpec trace: show the flattened draft_token_ids that will be verified.
+        if _hspec_trace_enabled():
+            di = min(_hspec_trace_req_idx(), self.input_batch.num_reqs - 1) \
+                if self.input_batch.num_reqs > 0 else 0
+            if di < self.input_batch.num_reqs:
+                trace_id = self.input_batch.req_ids[di]
+                tidx = di
+                n = int(num_draft_tokens[tidx])
+                if n > 0:
+                    start = 0 if tidx == 0 else int(cu_num_draft_tokens_np[tidx - 1])
+                    end = int(cu_num_draft_tokens_np[tidx])
+                    try:
+                        flat = draft_token_ids[start:end].detach().cpu().tolist()
+                    except Exception:
+                        flat = []
+                    logger.warning(
+                        "HSPEC TRACE model_runner._calc_spec_decode_metadata: "
+                        "req_id=%s req_idx=%d num_draft=%d flat_draft_token_ids=%s",
+                        str(trace_id),
+                        int(tidx),
+                        int(n),
+                        flat,
+                    )
 
         metadata = SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
@@ -2038,6 +2136,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             if self.dynamic_eplb:
                 self.eplb_updator.forward_before()
 
+            # HSpec trace: print a one-time banner (confirms this file/version is running).
+            _hspec_trace_banner(logger)
+
             (attn_metadata, positions, num_scheduled_tokens_np,
              num_input_tokens, num_tokens_across_dp, maybe_padded_num_tokens,
              logits_indices, spec_decode_metadata, input_ids, inputs_embeds,
@@ -2185,6 +2286,68 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 if self.need_accepted_tokens:
                     self._update_states_after_model_execute(output_token_ids)
 
+                # HSpec trace: explain accept/reject outcome for the traced request.
+                if _hspec_trace_enabled() and self.input_batch.num_reqs > 0:
+                    di = min(_hspec_trace_req_idx(), self.input_batch.num_reqs - 1)
+                    trace_id = self.input_batch.req_ids[di]
+                    t_req_idx = di
+                    draft = scheduler_output.scheduled_spec_decode_tokens.get(trace_id, [])
+                    n_draft = len(draft)
+                    if n_draft > 0:
+                        try:
+                            row = output_token_ids[t_req_idx].detach().cpu().tolist()
+                        except Exception:
+                            row = []
+                        accepted = 0
+                        for p in range(min(n_draft, len(row))):
+                            if row[p] == -1:
+                                break
+                            if int(row[p]) == int(draft[p]):
+                                accepted += 1
+                            else:
+                                break
+                        rejected = draft[accepted:]
+                        recovered_token = None
+                        if accepted < n_draft and accepted < len(row):
+                            if row[accepted] != -1:
+                                recovered_token = int(row[accepted])
+                        bonus_token = None
+                        if accepted == n_draft and n_draft < len(row):
+                            if row[n_draft] != -1:
+                                bonus_token = int(row[n_draft])
+
+                        req_state = self.requests.get(trace_id)
+                        decoded_len = len(req_state.output_token_ids) if req_state else -1
+                        try:
+                            from vllm_ascend.spec_decode.hspec_utils import prompt_id_from_token_ids
+                            prompt_id = (
+                                prompt_id_from_token_ids(req_state.prompt_token_ids)
+                                if req_state is not None else "<no_req_state>"
+                            )
+                        except Exception:
+                            prompt_id = "<prompt_id_error>"
+
+                        corr_id = f"req_id={trace_id!r} prompt_id={prompt_id!r} decoded_len={decoded_len}"
+                        logger.warning(
+                            "HSPEC TRACE rejection_result [req_idx=%d] %s | "
+                            "draft(len=%d)=%s | output_row=%s | "
+                            "accepted_draft_prefix_len=%d accepted_draft=%s rejected_draft=%s "
+                            "recovered_token=%s bonus_token=%s "
+                            "(sampling: all_greedy=%s all_random=%s)",
+                            int(di),
+                            corr_id,
+                            int(n_draft),
+                            list(draft),
+                            row,
+                            int(accepted),
+                            list(draft[:accepted]),
+                            list(rejected),
+                            str(recovered_token),
+                            str(bonus_token),
+                            str(getattr(sampling_metadata, "all_greedy", False)),
+                            str(getattr(sampling_metadata, "all_random", False)),
+                        )
+
             discard_sampled_tokens_req_indices: list[int] = []
             # TODO(woosuk): The following loop can be slow since it iterates over
             # the requests one by one. Optimize.
@@ -2323,6 +2486,30 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     aux_hidden_states,
                     sample_hidden_states=sample_hidden_states,
                 )
+                # HSPEC TRACE: always print per-step proposer output for the
+                # chosen req_idx (aligned with HSPEC DEBUG).
+                if _hspec_trace_enabled() and self.input_batch.num_reqs > 0:
+                    di = min(_hspec_trace_req_idx(), self.input_batch.num_reqs - 1)
+                    try:
+                        trace_req_id = self.input_batch.req_ids[di]
+                        draft_i = []
+                        if (self._draft_token_ids is not None
+                                and di < len(self._draft_token_ids)):
+                            draft_i = list(self._draft_token_ids[di])
+                        # This is the *current* step's proposer output. It will
+                        # only be verified in the *next* step if the engine
+                        # consumes it (i.e., scheduler schedules spec tokens).
+                        logger.warning(
+                            "HSPEC TRACE step_proposer_out [req_idx=%d]: "
+                            "req_id=%s draft_token_ids=%s (len=%d) "
+                            "| next_step_verification_depends_on_engine_post_step",
+                            int(di),
+                            str(trace_req_id),
+                            draft_i,
+                            int(len(draft_i)),
+                        )
+                    except Exception:
+                        pass
 
             if has_kv_transfer_group():
                 get_kv_transfer_group().clear_connector_metadata()
@@ -2369,6 +2556,21 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         else:
             draft_token_ids = self._draft_token_ids
         self._draft_token_ids = None
+        if _hspec_trace_enabled() and self.input_batch.num_reqs > 0:
+            di = min(_hspec_trace_req_idx(), self.input_batch.num_reqs - 1)
+            try:
+                trace_id = self.input_batch.req_ids[di]
+                if di < len(draft_token_ids):
+                    logger.warning(
+                        "HSPEC TRACE model_runner.take_draft_token_ids [req_idx=%d]: "
+                        "req_id=%s draft_token_ids=%s (len=%d)",
+                        int(di),
+                        str(trace_id),
+                        list(draft_token_ids[di]),
+                        int(len(draft_token_ids[di])),
+                    )
+            except Exception:
+                pass
         return DraftTokenIds(req_ids, draft_token_ids)
 
     def kv_connector_no_forward(

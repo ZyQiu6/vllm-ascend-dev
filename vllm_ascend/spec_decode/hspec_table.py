@@ -98,9 +98,12 @@ class PromptTableData:
         """
         L = len(token_sequence)
         room = self.max_entries - self.n_entries
-        if room <= 0 or L == 0:
+        # Value shift (critical): entry at position t stores value starting from
+        # y[t+1:], so the draft produced *after* accepting y[t] begins at the
+        # next token and does not repeat the just-accepted token.
+        if room <= 0 or L <= 1:
             return 0
-        n_add = min(L, room)
+        n_add = min(L - 1, room)
 
         # Store the full token sequence *once*  (reference-based value)
         ridx = len(self.rollout_seqs)
@@ -108,7 +111,7 @@ class PromptTableData:
             np.ascontiguousarray(token_sequence[:L], dtype=np.int32)
         )
 
-        # L2-normalise projected keys for cosine similarity
+        # Store projected keys (raw dot-product similarity).
         kf = projected_keys[:n_add].astype(np.float32, copy=False)
         # norms = np.linalg.norm(kf, axis=1, keepdims=True)
         # np.maximum(norms, 1e-8, out=norms)
@@ -118,7 +121,8 @@ class PromptTableData:
         e = s + n_add
         self.keys[s:e] = kf.astype(np.float16)
         self.entry_rollout_idx[s:e] = ridx
-        self.entry_offset[s:e] = np.arange(n_add, dtype=np.int32)
+        # Value shift: offset starts at 1 (y[1]) for t=0, ... , y[L-1] is dropped.
+        self.entry_offset[s:e] = np.arange(1, n_add + 1, dtype=np.int32)
         self.rewards[s:e] = reward
         self.n_entries = e
         return n_add
@@ -139,15 +143,15 @@ class PromptTableData:
 
     def query(
         self,
-        query_z_normalised: np.ndarray,
+        query_z: np.ndarray,
         threshold: float,
         accept_length: int = 1,
     ) -> Tuple[List[int], float]:
         """Find best match and return draft tokens.
 
         Args:
-            query_z_normalised: (K,) L2-normalised PCA-projected query.
-            threshold:          cosine-similarity threshold.
+            query_z:            (K,) PCA-projected query (no normalisation).
+            threshold:          raw dot-product threshold.
             accept_length:      previous accept length (for window control).
 
         Returns:
@@ -157,11 +161,10 @@ class PromptTableData:
             return [], 0.0
         self._update_wnd(accept_length)
 
-        # Dot-product similarity (both sides L2-normalised → cosine sim)
-        # Upcast fp16 keys to fp32 for numerical accuracy of the dot.
+        # Dot-product similarity
         sims = self.keys[: self.n_entries].astype(np.float32).dot(
-            query_z_normalised.astype(np.float32)
-        )  # (M,)
+            query_z.astype(np.float32, copy=False)
+        )
 
         best_idx = int(np.argmax(sims))
         best_sim = float(sims[best_idx])
@@ -356,13 +359,10 @@ class HSpecTableGroup:
             return []
 
         table = self._active[prompt_id]
-        # Project  → (K,) and L2-normalise
+        # Project  → (K,)
         z = table.pca_params.project(
             hidden_state.reshape(1, -1).astype(np.float32, copy=False)
         ).squeeze(0)  # (K,)
-        norm = float(np.linalg.norm(z))
-        if norm > 1e-8:
-            z /= norm
 
         draft, sim = table.query(z, self.similarity_threshold, accept_length)
         if draft:

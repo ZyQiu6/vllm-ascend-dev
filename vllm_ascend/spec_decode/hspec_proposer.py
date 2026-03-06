@@ -457,17 +457,20 @@ class HSpecProposer(Proposer):
 
     def _build_cached_table(self, data: dict) -> _CachedPromptTable:
         """Convert serialised table data dict → on-device cached table."""
-        mean = torch.from_numpy(
-            data["mean"].astype(np.float32, copy=False),
-        ).to(self.device, non_blocking=True)
+        # NOTE: Ray may deserialize numpy arrays as non-writable (read-only)
+        # views; torch.from_numpy warns about undefined behaviour on write.
+        # These tensors are read-only in our usage, but we still copy here to
+        # silence warnings and keep behaviour well-defined. This is *prefetch*
+        # (not in the hot loop).
+        mean_np = np.array(data["mean"], dtype=np.float32, copy=True)
+        comp_np = np.array(data["components"], dtype=np.float32, copy=True)
+        keys_np = np.array(data["keys"], dtype=np.float32, copy=True)
 
-        components = torch.from_numpy(
-            data["components"].astype(np.float32, copy=False),
-        ).to(self.device, non_blocking=True)
+        mean = torch.from_numpy(mean_np).to(self.device, non_blocking=True)
 
-        keys = torch.from_numpy(
-            data["keys"].astype(np.float32, copy=False),
-        ).to(self.device, non_blocking=True)
+        components = torch.from_numpy(comp_np).to(self.device, non_blocking=True)
+
+        keys = torch.from_numpy(keys_np).to(self.device, non_blocking=True)
 
         # Ensure rollout_seqs are numpy arrays on CPU
         rollout_seqs = []
@@ -598,6 +601,7 @@ class HSpecProposer(Proposer):
 
         if HSPEC_DEBUG:
             # (1)(2) One prompt per step: only the chosen request
+            # Log correlation fields (req_id, prompt_id, decoded_len, decoded_tokens)
             try:
                 di = min(HSPEC_DEBUG_REQ_IDX, batch_size - 1) if batch_size else 0
                 req_id = input_batch.req_ids[di]
@@ -608,6 +612,9 @@ class HSpecProposer(Proposer):
                 else:
                     decoded_tokens = list(getattr(req_state, "output_token_ids", []))
                     prompt_tokens = list(getattr(req_state, "prompt_token_ids", []))
+                decoded_len = len(decoded_tokens)
+                # Correlation id: same (req_id, prompt_id, decoded_len) in STEP_BEGIN and CACHE_MATCH
+                corr_id = f"req_id={req_id!r} prompt_id={prompt_ids[di]!r} decoded_len={decoded_len}"
                 anchor_hs_summary = "anchor_hs=None"
                 if di < len(anchor_list) and anchor_list[di] is not None:
                     hs = anchor_list[di]
@@ -622,19 +629,19 @@ class HSpecProposer(Proposer):
                 tokenizer = _get_tokenizer_safe(self.runner)
                 prompt_decoded_text = _detokenize_safe(tokenizer, prompt_tokens + decoded_tokens)
                 logger.info(
-                    "------------------------------------------- generate_token_ids() begin -------------------------------------------\n"
-                    "HSPEC DEBUG generate_token_ids() [req_idx=%d]: "
-                    "hidden_states.shape=%s dtype=%s device=%s | "
-                    "prompt_id=%s prompt_tokens=%s \n decoded_tokens=%s accepted_step_tokens=%s | "
+                    "------------------------------------------- generate_token_ids() STEP_BEGIN -------------------------------------------\n"
+                    "HSPEC DEBUG STEP_BEGIN [req_idx=%d] %s | "
+                    "decoded_tokens=%s | accepted_step_tokens=%s | "
+                    "hidden_states.shape=%s dtype=%s device=%s | prompt_tokens=%s | "
                     "prompt+decoded_text=%r | %s",
                     di,
+                    corr_id,
+                    decoded_tokens,
+                    valid_sampled_token_ids[di] if di < len(valid_sampled_token_ids) else [],
                     tuple(hidden_states.shape),
                     str(hidden_states.dtype),
                     hidden_states.device,
-                    prompt_ids[di] if di < len(prompt_ids) else "",
                     prompt_tokens,
-                    decoded_tokens,
-                    valid_sampled_token_ids[di] if di < len(valid_sampled_token_ids) else [],
                     prompt_decoded_text,
                     anchor_hs_summary,
                 )
@@ -683,9 +690,19 @@ class HSpecProposer(Proposer):
         if HSPEC_DEBUG:
             try:
                 di = min(HSPEC_DEBUG_REQ_IDX, batch_size - 1) if batch_size else 0
+                req_id = input_batch.req_ids[di]
+                req_state = self.runner.requests.get(req_id)
+                decoded_tokens_at_match = []
+                if req_state is not None:
+                    decoded_tokens_at_match = list(getattr(req_state, "output_token_ids", []))
+                decoded_len_at_match = len(decoded_tokens_at_match)
+                corr_id = f"req_id={req_id!r} prompt_id={prompt_ids[di]!r} decoded_len={decoded_len_at_match}"
+
                 # Pending list: only the chosen request if it is in pending
                 pending_line = None
                 cached_for_debug = None
+                best_idx_val = -1
+                sim_val = float("nan")
                 for (i, sim_t, idx_t, cached) in pending:
                     if i != di:
                         continue
@@ -699,28 +716,30 @@ class HSpecProposer(Proposer):
                     except Exception:
                         best_idx_val = -1
                     pending_line = (
-                        f"pending [req_idx={di}] prompt_id={prompt_ids[di]!r} "
-                        f"sim={sim_val:.6f} best_idx={best_idx_val} n_entries={cached.n_entries}"
+                        f"CACHE_MATCH [req_idx={di}] {corr_id} | "
+                        f"decoded_tokens_at_match={decoded_tokens_at_match} | "
+                        f"best_idx={best_idx_val} sim={sim_val:.6f} n_entries={cached.n_entries}"
                     )
                     break
                 if pending_line is None:
                     pending_line = (
-                        f"pending: req_idx={di} not in pending (pending_size=%d)"
-                        % len(pending)
+                        f"CACHE_MATCH [req_idx={di}] {corr_id} | "
+                        f"decoded_tokens_at_match={decoded_tokens_at_match} | "
+                        f"not_in_pending (pending_size={len(pending)})"
                     )
                 else:
-                    # (1) Print cache table contents (all entries)
+                    # (1) Print cache table contents (all entries) with correlation to decoded state
                     if cached_for_debug is not None:
                         table_info_lines = []
                         n_entries = cached_for_debug.n_entries
                         table_info_lines.append(
-                            f"cache_table[pid={prompt_ids[di]!r}] n_entries={n_entries} "
-                            f"wnd_size={cached_for_debug.wnd_size} "
+                            f"cache_table {corr_id} | decoded_tokens_at_match={decoded_tokens_at_match} | "
+                            f"n_entries={n_entries} wnd_size={cached_for_debug.wnd_size} "
                             f"mean.shape={tuple(cached_for_debug.mean.shape)} "
                             f"components.shape={tuple(cached_for_debug.components.shape)} "
-                            f"keys.shape={tuple(cached_for_debug.keys.shape)}"
+                            f"keys.shape={tuple(cached_for_debug.keys.shape)} | "
+                            f"best_hit_entry={best_idx_val} → draft_tokens_for_next_step (see entry below)"
                         )
-                        # Print all entries
                         tokenizer = _get_tokenizer_safe(self.runner)
                         for entry_idx in range(n_entries):
                             ridx = int(cached_for_debug.entry_rollout_idx[entry_idx])
@@ -742,14 +761,16 @@ class HSpecProposer(Proposer):
                             except Exception:
                                 entry_sim = float("nan")
                             table_info_lines.append(
-                                f"  entry[{entry_idx}]: rollout_idx={ridx} offset={off} "
-                                f"sim={entry_sim:.4f} draft_tokens={draft_tokens} "
+                                f"  entry[{entry_idx}] rollout_idx={ridx} offset={off} "
+                                f"sim={entry_sim:.4f} | "
+                                f"decoded_tokens_at_match={decoded_tokens_at_match} → draft_tokens={draft_tokens} "
                                 f"rollout_text={rollout_text!r}"
                             )
                         pending_line += "\n" + "\n".join(table_info_lines)
                 logger.info(
-                    "HSPEC DEBUG generate_token_ids() [req_idx=%d]: %s",
-                    di, pending_line,
+                    "------------------------------------------- generate_token_ids() CACHE_MATCH -------------------------------------------\n"
+                    "HSPEC DEBUG %s",
+                    pending_line,
                 )
             except Exception:
                 logger.exception("HSPEC DEBUG: failed to log pending list")
