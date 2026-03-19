@@ -131,6 +131,7 @@ from vllm_ascend.spec_decode.hspec_proposer import HSpecProposer
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
 from vllm_ascend.spec_decode.interface import SpecDcodeType
 from vllm_ascend.spec_decode.mtp_proposer import MtpProposer
+from vllm_ascend.spec_decode.hspec_utils import hspec_record_function
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
                                AscendSocVersion, ProfileExecuteDuration,
                                enable_sp, get_ascend_soc_version, is_310p,
@@ -161,8 +162,21 @@ def _hspec_trace_req_idx() -> int:
 
 def _hspec_trace_enabled() -> bool:
     """Enable extra trace logs when HSPEC_TRACE=1 or HSPEC_DEBUG=1 is set."""
-    return (os.getenv("HSPEC_TRACE", "0") != "0"
-            or os.getenv("HSPEC_DEBUG", "0") != "0")
+    return (os.getenv("HSPEC_TRACE", "0") != "0")
+
+
+# HSpec per-token generation timing breakdown (very verbose; opt-in).
+def _hspec_gen_enabled() -> bool:
+    return os.getenv("HSPEC_GEN", "0") != "0"
+
+
+def _hspec_gen_req_idx() -> int:
+    """Which request index to trace for HSPEC_GEN (defaults to HSPEC_DEBUG_REQ_IDX)."""
+    try:
+        from vllm_ascend.spec_decode.hspec_proposer import HSPEC_GEN_REQ_IDX
+        return int(HSPEC_GEN_REQ_IDX)
+    except Exception:
+        return int(os.getenv("HSPEC_GEN_REQ_IDX", os.getenv("HSPEC_DEBUG_REQ_IDX", "3")))
 
 
 def _hspec_trace_banner(logger) -> None:
@@ -2030,11 +2044,34 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     if sample_hidden_states is not None
                     else hidden_states
                 )
+                _hspec_gen = _hspec_gen_enabled()
+                _hspec_gen_idx = _hspec_gen_req_idx() if _hspec_gen else -1
+                _t0_gen = time.perf_counter_ns() if _hspec_gen else 0
                 draft_token_ids = self.drafter.generate_token_ids(
                     valid_sampled_token_ids, sampling_metadata,
                     scheduler_output, spec_decode_metadata, positions,
                     num_scheduled_tokens, hs_for_hspec, attn_metadata,
                     aux_hidden_states)
+                if _hspec_gen and self.input_batch.num_reqs > 0:
+                    di = min(_hspec_gen_idx, self.input_batch.num_reqs - 1)
+                    try:
+                        req_id = self.input_batch.req_ids[di]
+                        req_state = self.requests.get(req_id)
+                        decoded_len = len(getattr(req_state, "output_token_ids", [])) if req_state is not None else -1
+                        dt_ms = (time.perf_counter_ns() - _t0_gen) / 1_000_000.0
+                        d = (draft_token_ids[di] if (draft_token_ids is not None and di < len(draft_token_ids)) else [])
+                        logger.warning(
+                            "HSPEC GEN runner_propose_total [req_idx=%d] req_id=%s decoded_len=%d "
+                            "propose_total_ms=%.3f draft_len=%d draft=%s",
+                            int(di),
+                            str(req_id),
+                            int(decoded_len),
+                            float(dt_ms),
+                            int(len(d)),
+                            list(d),
+                        )
+                    except Exception:
+                        pass
             else:
                 draft_token_ids = self.drafter.generate_token_ids(
                     valid_sampled_token_ids, sampling_metadata, scheduler_output,
@@ -2219,8 +2256,30 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # cache is typically warm → zero blocking in the hot loop.
             if (self._hspec_collect and self.drafter is not None
                     and hasattr(self.drafter, 'prefetch_for_batch')):
-                self.drafter.prefetch_for_batch(
-                    self.input_batch.req_ids[:self.input_batch.num_reqs])
+                _hspec_gen = _hspec_gen_enabled()
+                _hspec_gen_idx = _hspec_gen_req_idx() if _hspec_gen else -1
+                _t0_prefetch = time.perf_counter_ns() if _hspec_gen else 0
+                with hspec_record_function("hspec/prefetch/launch"):
+                    self.drafter.prefetch_for_batch(
+                        self.input_batch.req_ids[:self.input_batch.num_reqs])
+                if _hspec_gen and self.input_batch.num_reqs > 0:
+                    di = min(_hspec_gen_idx, self.input_batch.num_reqs - 1)
+                    try:
+                        trace_id = self.input_batch.req_ids[di]
+                        req_state = self.requests.get(trace_id)
+                        decoded_len = len(getattr(req_state, "output_token_ids", [])) if req_state is not None else -1
+                        dt_ms = (time.perf_counter_ns() - _t0_prefetch) / 1_000_000.0
+                        logger.warning(
+                            "HSPEC GEN prefetch_launch [req_idx=%d] req_id=%s decoded_len=%d "
+                            "prefetch_launch_ms=%.3f batch_num_reqs=%d",
+                            int(di),
+                            str(trace_id),
+                            int(decoded_len),
+                            float(dt_ms),
+                            int(self.input_batch.num_reqs),
+                        )
+                    except Exception:
+                        pass
 
         moe_comm_type = self._select_moe_comm_method(num_input_tokens,
                                                      self.with_prefill)
@@ -2328,24 +2387,89 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 assert logits is not None
                 bonus_logits = logits[
                     spec_decode_metadata.bonus_logits_indices]
-                sampler_output = self.sampler(
-                    logits=bonus_logits,
-                    sampling_metadata=sampling_metadata,
-                )
+                _hspec_gen = _hspec_gen_enabled()
+                _hspec_gen_idx = _hspec_gen_req_idx() if _hspec_gen else -1
+                _t0_bonus = time.perf_counter_ns() if _hspec_gen else 0
+                with hspec_record_function("hspec/verification/bonus_sampler", use_npu_stream=True):
+                    sampler_output = self.sampler(
+                        logits=bonus_logits,
+                        sampling_metadata=sampling_metadata,
+                    )
                 bonus_token_ids = sampler_output.sampled_token_ids
+                if _hspec_gen and self.input_batch.num_reqs > 0:
+                    di = min(_hspec_gen_idx, self.input_batch.num_reqs - 1)
+                    try:
+                        trace_id = self.input_batch.req_ids[di]
+                        req_state = self.requests.get(trace_id)
+                        decoded_len = len(getattr(req_state, "output_token_ids", [])) if req_state is not None else -1
+                        dt_ms = (time.perf_counter_ns() - _t0_bonus) / 1_000_000.0
+                        logger.warning(
+                            "HSPEC GEN bonus_sampler [req_idx=%d] req_id=%s decoded_len=%d "
+                            "bonus_sampler_ms=%.3f bonus_logits_shape=%s",
+                            int(di),
+                            str(trace_id),
+                            int(decoded_len),
+                            float(dt_ms),
+                            str(tuple(bonus_logits.shape)),
+                        )
+                    except Exception:
+                        pass
 
                 # Just like `bonus_logits`, `target_logits` is a new tensor with
                 # separate storage from the original `logits` tensor. Therefore,
                 # it is safe to update `target_logits` in place.
-                target_logits = logits[
-                    spec_decode_metadata.target_logits_indices]
-                output_token_ids = self.rejection_sampler(
-                    spec_decode_metadata,
-                    None,  # draft_probs
-                    target_logits,
-                    bonus_token_ids,
-                    sampling_metadata,
-                )
+                _t0_target = time.perf_counter_ns() if _hspec_gen else 0
+                with hspec_record_function("hspec/verification/target_logits_slice", use_npu_stream=True):
+                    target_logits = logits[
+                        spec_decode_metadata.target_logits_indices]
+                if _hspec_gen and self.input_batch.num_reqs > 0:
+                    di = min(_hspec_gen_idx, self.input_batch.num_reqs - 1)
+                    try:
+                        trace_id = self.input_batch.req_ids[di]
+                        req_state = self.requests.get(trace_id)
+                        decoded_len = len(getattr(req_state, "output_token_ids", [])) if req_state is not None else -1
+                        dt_ms = (time.perf_counter_ns() - _t0_target) / 1_000_000.0
+                        logger.warning(
+                            "HSPEC GEN target_logits_slice [req_idx=%d] req_id=%s decoded_len=%d "
+                            "target_slice_ms=%.3f target_logits_shape=%s",
+                            int(di),
+                            str(trace_id),
+                            int(decoded_len),
+                            float(dt_ms),
+                            str(tuple(target_logits.shape)),
+                        )
+                    except Exception:
+                        pass
+                _t0_rej = time.perf_counter_ns() if _hspec_gen else 0
+                with hspec_record_function("hspec/verification/rejection_sampler", use_npu_stream=True):
+                    output_token_ids = self.rejection_sampler(
+                        spec_decode_metadata,
+                        None,  # draft_probs
+                        target_logits,
+                        bonus_token_ids,
+                        sampling_metadata,
+                    )
+                if _hspec_gen and self.input_batch.num_reqs > 0:
+                    di = min(_hspec_gen_idx, self.input_batch.num_reqs - 1)
+                    try:
+                        trace_id = self.input_batch.req_ids[di]
+                        draft = scheduler_output.scheduled_spec_decode_tokens.get(trace_id, [])
+                        req_state = self.requests.get(trace_id)
+                        decoded_len = len(getattr(req_state, "output_token_ids", [])) if req_state is not None else -1
+                        dt_ms = (time.perf_counter_ns() - _t0_rej) / 1_000_000.0
+                        logger.warning(
+                            "HSPEC GEN rejection_sampler [req_idx=%d] req_id=%s decoded_len=%d "
+                            "rejection_sampler_ms=%.3f draft_len=%d draft=%s out_shape=%s",
+                            int(di),
+                            str(trace_id),
+                            int(decoded_len),
+                            float(dt_ms),
+                            int(len(draft)),
+                            list(draft),
+                            str(tuple(output_token_ids.shape)) if hasattr(output_token_ids, "shape") else "<no_shape>",
+                        )
+                    except Exception:
+                        pass
                 sampler_output.sampled_token_ids = output_token_ids
                 if self.need_accepted_tokens:
                     self._update_states_after_model_execute(output_token_ids)
@@ -2456,10 +2580,43 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     valid_sampled_token_ids = sampled_token_ids.tolist()
                 else:
                     # Includes spec decode tokens.
-                    valid_sampled_token_ids = self.rejection_sampler.parse_output(
-                        sampled_token_ids,
-                        self.input_batch.vocab_size,
-                    )
+                    _hspec_gen = _hspec_gen_enabled()
+                    _hspec_gen_idx = _hspec_gen_req_idx() if _hspec_gen else -1
+                    _t0_parse = time.perf_counter_ns() if _hspec_gen else 0
+                    with hspec_record_function("hspec/verification/parse_output"):
+                        valid_sampled_token_ids = self.rejection_sampler.parse_output(
+                            sampled_token_ids,
+                            self.input_batch.vocab_size,
+                        )
+                    if _hspec_gen and self.input_batch.num_reqs > 0:
+                        di = min(_hspec_gen_idx, self.input_batch.num_reqs - 1)
+                        try:
+                            trace_id = self.input_batch.req_ids[di]
+                            draft = scheduler_output.scheduled_spec_decode_tokens.get(trace_id, [])
+                            out = (valid_sampled_token_ids[di]
+                                   if di < len(valid_sampled_token_ids) else [])
+                            dt_ms = (time.perf_counter_ns() - _t0_parse) / 1_000_000.0
+                            accepted = 0
+                            for p in range(min(len(draft), len(out))):
+                                if int(out[p]) == int(draft[p]):
+                                    accepted += 1
+                                else:
+                                    break
+                            req_state = self.requests.get(trace_id)
+                            decoded_len = len(getattr(req_state, "output_token_ids", [])) if req_state is not None else -1
+                            logger.warning(
+                                "HSPEC GEN parse_output [req_idx=%d] req_id=%s decoded_len=%d "
+                                "parse_output_ms=%.3f out_len=%d out=%s accepted_draft_prefix_len=%d",
+                                int(di),
+                                str(trace_id),
+                                int(decoded_len),
+                                float(dt_ms),
+                                int(len(out)),
+                                list(out),
+                                int(accepted),
+                            )
+                        except Exception:
+                            pass
 
                 # HSpec verification metrics (post rejection-sampling).
                 # We compute on CPU lists (valid_sampled_token_ids) to avoid
@@ -2563,25 +2720,50 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             if (self._hspec_collect
                     and not self.use_async_scheduling
                     and sample_hidden_states is not None):
-                self._hspec_accumulate_hidden_states(
-                    sample_hidden_states,
-                    valid_sampled_token_ids,
-                    spec_decode_metadata,
-                )
+                _hspec_gen = _hspec_gen_enabled()
+                _hspec_gen_idx = _hspec_gen_req_idx() if _hspec_gen else -1
+                _t0_acc = time.perf_counter_ns() if _hspec_gen else 0
+                with hspec_record_function("hspec/verification/accumulate_hidden_states", use_npu_stream=True):
+                    self._hspec_accumulate_hidden_states(
+                        sample_hidden_states,
+                        valid_sampled_token_ids,
+                        spec_decode_metadata,
+                    )
+                if _hspec_gen and self.input_batch.num_reqs > 0:
+                    di = min(_hspec_gen_idx, self.input_batch.num_reqs - 1)
+                    try:
+                        trace_id = self.input_batch.req_ids[di]
+                        req_state = self.requests.get(trace_id)
+                        decoded_len = len(getattr(req_state, "output_token_ids", [])) if req_state is not None else -1
+                        out = (valid_sampled_token_ids[di]
+                               if di < len(valid_sampled_token_ids) else [])
+                        dt_ms = (time.perf_counter_ns() - _t0_acc) / 1_000_000.0
+                        logger.warning(
+                            "HSPEC GEN accumulate_hidden_states [req_idx=%d] req_id=%s decoded_len=%d "
+                            "accumulate_hs_ms=%.3f accepted_len=%d",
+                            int(di),
+                            str(trace_id),
+                            int(decoded_len),
+                            float(dt_ms),
+                            int(len(out)),
+                        )
+                    except Exception:
+                        pass
 
             if self.speculative_config:
-                self._draft_token_ids = self.propose_draft_token_ids(
-                    valid_sampled_token_ids,
-                    sampling_metadata,
-                    scheduler_output,
-                    spec_decode_metadata,
-                    positions,
-                    scheduler_output.total_num_scheduled_tokens,
-                    hidden_states,
-                    attn_metadata,
-                    aux_hidden_states,
-                    sample_hidden_states=sample_hidden_states,
-                )
+                with hspec_record_function("hspec/proposal/total", use_npu_stream=True):
+                    self._draft_token_ids = self.propose_draft_token_ids(
+                        valid_sampled_token_ids,
+                        sampling_metadata,
+                        scheduler_output,
+                        spec_decode_metadata,
+                        positions,
+                        scheduler_output.total_num_scheduled_tokens,
+                        hidden_states,
+                        attn_metadata,
+                        aux_hidden_states,
+                        sample_hidden_states=sample_hidden_states,
+                    )
                 # HSPEC TRACE: always print per-step proposer output for the
                 # chosen req_idx (aligned with HSPEC DEBUG).
                 if _hspec_trace_enabled() and self.input_batch.num_reqs > 0:

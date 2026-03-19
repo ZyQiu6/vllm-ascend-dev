@@ -20,6 +20,7 @@ import logging
 import os
 import time
 from collections import OrderedDict
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
@@ -36,7 +37,11 @@ from vllm_ascend.spec_decode.hspec_table import (
     GlobalHSpecTableGroup,
     get_hspec_tables,
 )
-from vllm_ascend.spec_decode.hspec_utils import prompt_id_from_token_ids
+from vllm_ascend.spec_decode.hspec_utils import (
+    hspec_profile_context_enabled,
+    hspec_record_function,
+    prompt_id_from_token_ids,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("HSPEC_LOG_LEVEL", os.getenv("VERL_LOGGING_LEVEL", "WARN")))
@@ -45,6 +50,23 @@ logger.setLevel(os.getenv("HSPEC_LOG_LEVEL", os.getenv("VERL_LOGGING_LEVEL", "WA
 HSPEC_DEBUG = os.getenv("HSPEC_DEBUG", "0") != "0"
 # Per-step debug: only log one request per step to limit log volume.
 HSPEC_DEBUG_REQ_IDX = int(os.getenv("HSPEC_DEBUG_REQ_IDX", "3"))
+
+# Per-token generation breakdown timing (very verbose; use only for debugging).
+# Enable with HSPEC_GEN=1. By default, trace the same request index as
+# HSPEC_DEBUG_REQ_IDX; can override via HSPEC_GEN_REQ_IDX.
+HSPEC_GEN = os.getenv("HSPEC_GEN", "0") != "0"
+HSPEC_GEN_REQ_IDX = int(os.getenv("HSPEC_GEN_REQ_IDX",
+                                  os.getenv("HSPEC_DEBUG_REQ_IDX", "3")))
+HSPEC_GEN_MAX_CALLS = int(os.getenv("HSPEC_GEN_MAX_CALLS", "0"))  # 0 = no limit
+
+
+def _now_ns() -> int:
+    # perf_counter_ns is monotonic and high resolution; safe for timings.
+    return time.perf_counter_ns()
+
+
+def _ns_to_ms(ns: int) -> float:
+    return float(ns) / 1_000_000.0
 
 
 # Worker-local cached prompt table (on-device tensors + CPU refs)
@@ -606,6 +628,8 @@ class HSpecProposer(Proposer):
         steady state.  The only CPU work is a tiny scalar transfer
         ``(P, 2)`` and sub-µs numpy slices for draft tokens.
         """
+        # NOTE: HSPEC_GEN is intentionally implemented to be *zero-cost* when
+        # disabled (only a single boolean check in hot loop).
         batch_size = len(valid_sampled_token_ids)
         if batch_size == 0:
             return []
@@ -613,11 +637,22 @@ class HSpecProposer(Proposer):
             return [[] for _ in range(batch_size)]
         input_batch = self.runner.input_batch
 
+        gen_enabled = HSPEC_GEN
+        gen_req_idx = HSPEC_GEN_REQ_IDX
+        if gen_enabled and HSPEC_GEN_MAX_CALLS > 0:
+            # Hard cap to avoid runaway logs in long trainings.
+            # We use _stat_calls as a monotonic per-call counter already
+            # maintained by this proposer.
+            if getattr(self, "_stat_calls", 0) >= HSPEC_GEN_MAX_CALLS:
+                gen_enabled = False
+        prof_enabled = hspec_profile_context_enabled()
+
         # 1. Stable prompt_id + anchor hidden state per request
         prompt_ids: List[str] = []
         anchor_list: List[Optional[torch.Tensor]] = []
 
         for i in range(batch_size):
+            t0_anchor = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
             req_id = input_batch.req_ids[i]
             req_state = self.runner.requests.get(req_id)
             if req_state is None:
@@ -626,15 +661,31 @@ class HSpecProposer(Proposer):
                 continue
 
             # Stable prompt_id from ORIGINAL prompt tokens (not token_ids_cpu)
-            pid = prompt_id_from_token_ids(req_state.prompt_token_ids)
+            t0_pid = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
+            with (hspec_record_function("hspec/proposal/prompt_id")
+                  if prof_enabled else nullcontext()):
+                pid = prompt_id_from_token_ids(req_state.prompt_token_ids)
+            t1_pid = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
             prompt_ids.append(pid)
 
             # Anchor hidden state for this request
-            hs = self._extract_anchor_hs(
-                i, hidden_states, valid_sampled_token_ids,
-                spec_decode_metadata,
-            )
+            t0_extract = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
+            with (hspec_record_function("hspec/proposal/extract_anchor_hs")
+                  if prof_enabled else nullcontext()):
+                hs = self._extract_anchor_hs(
+                    i, hidden_states, valid_sampled_token_ids,
+                    spec_decode_metadata,
+                )
+            t1_extract = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
             anchor_list.append(hs)
+            if gen_enabled and i == gen_req_idx:
+                # Stash per-call stage timing for the traced request.
+                # We will include it in the final log after draft retrieval.
+                self._hspec_gen_timing = {
+                    "prompt_id_ms": _ns_to_ms(t1_pid - t0_pid) if t0_pid else 0.0,
+                    "extract_anchor_hs_ms": _ns_to_ms(t1_extract - t0_extract) if t0_extract else 0.0,
+                    "anchor_total_ms": _ns_to_ms(_now_ns() - t0_anchor) if t0_anchor else 0.0,
+                }
 
         if HSPEC_DEBUG:
             # (1)(2) One prompt per step: only the chosen request
@@ -689,40 +740,79 @@ class HSpecProposer(Proposer):
         # prefetch_for_batch() was already called before the forward pass.
         # Here we poll for any newly-ready futures and fire for prompts
         # that might have arrived after the early prefetch.
-        self._poll_pending()
-        self._fire_prefetch_async(prompt_ids)
+        t0_poll = _now_ns() if gen_enabled else 0
+        with hspec_record_function("hspec/proposal/poll_pending"):
+            self._poll_pending()
+        t1_poll = _now_ns() if gen_enabled else 0
+        t0_fire = _now_ns() if gen_enabled else 0
+        with hspec_record_function("hspec/proposal/fire_prefetch_async"):
+            self._fire_prefetch_async(prompt_ids)
+        t1_fire = _now_ns() if gen_enabled else 0
 
         # 3. On-device projection + similarity matching
         results: List[List[int]] = [[] for _ in range(batch_size)]
         # Accumulate on-device tensors to batch the single CPU sync
         pending: List[tuple] = []   # (batch_idx, sim_tensor, idx_tensor, cached)
+        trace_pending_j: Optional[int] = None
+        trace_skip_reason: Optional[str] = None
 
         for i in range(batch_size):
             hs = anchor_list[i]
             pid = prompt_ids[i]
-            if hs is None or pid not in self._cache:
+            if hs is None:
+                if gen_enabled and i == gen_req_idx:
+                    trace_skip_reason = "anchor_none"
+                continue
+            if pid not in self._cache:
+                if gen_enabled and i == gen_req_idx:
+                    trace_skip_reason = "prompt_not_cached"
                 continue
             cached = self._cache[pid]
             if cached.n_entries == 0:
+                if gen_enabled and i == gen_req_idx:
+                    trace_skip_reason = "empty_prompt_table"
                 continue
             if len(valid_sampled_token_ids[i]) < self.min_match_len:
+                if gen_enabled and i == gen_req_idx:
+                    trace_skip_reason = (
+                        f"below_min_match_len:{len(valid_sampled_token_ids[i])}"
+                    )
                 continue
 
             # All on NPU, no CPU sync
             # Cast bf16 → fp32 (Ascend NPU doesn't support bf16↔CPU)
-            hs_f = hs.float()
+            t0_cast = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
+            prof_this_req = prof_enabled
+            with (hspec_record_function("hspec/proposal/project_and_match", use_npu_stream=True)
+                  if prof_this_req else nullcontext()):
+                hs_f = hs.float()
+                t1_cast = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
 
-            # Project: z = (h − μ) Wᵀ   →  (K,)
-            z = (hs_f - cached.mean) @ cached.components.T
+                # Project: z = (h − μ) Wᵀ   →  (K,)
+                t0_proj = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
+                z = (hs_f - cached.mean) @ cached.components.T
+                t1_proj = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
 
-            # L2 normalise
-            # z = F.normalize(z, dim=0)
+                # L2 normalise
+                # z = F.normalize(z, dim=0)
 
-            # Cosine similarity with all stored keys
-            sims = cached.keys @ z          # (n_entries,)
-            best_sim, best_idx = sims.max(dim=0)
+                # Cosine similarity with all stored keys
+                t0_sim = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
+                sims = cached.keys @ z          # (n_entries,)
+                best_sim, best_idx = sims.max(dim=0)
+                t1_sim = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
 
             pending.append((i, best_sim, best_idx, cached))
+            if gen_enabled and i == gen_req_idx:
+                trace_pending_j = len(pending) - 1
+                # Accumulate stage timings for traced request.
+                td = getattr(self, "_hspec_gen_timing", {}) if hasattr(self, "_hspec_gen_timing") else {}
+                td.update({
+                    "cast_fp32_ms": _ns_to_ms(t1_cast - t0_cast) if t0_cast else 0.0,
+                    "pca_project_ms": _ns_to_ms(t1_proj - t0_proj) if t0_proj else 0.0,
+                    "similarity_ms": _ns_to_ms(t1_sim - t0_sim) if t0_sim else 0.0,
+                })
+                self._hspec_gen_timing = td
 
         if HSPEC_DEBUG:
             try:
@@ -813,18 +903,49 @@ class HSpecProposer(Proposer):
                 logger.exception("HSPEC DEBUG: failed to log pending list")
 
         if not pending:
+            if gen_enabled and batch_size > 0:
+                di = min(gen_req_idx, batch_size - 1)
+                try:
+                    req_id = input_batch.req_ids[di]
+                    req_state = self.runner.requests.get(req_id)
+                    decoded_len = len(getattr(req_state, "output_token_ids", [])) if req_state is not None else -1
+                    pid = prompt_ids[di] if di < len(prompt_ids) else ""
+                    td = getattr(self, "_hspec_gen_timing", {}) if hasattr(self, "_hspec_gen_timing") else {}
+                    td.update({
+                        "poll_pending_ms": _ns_to_ms(t1_poll - t0_poll) if t0_poll else 0.0,
+                        "fire_prefetch_async_ms": _ns_to_ms(t1_fire - t0_fire) if t0_fire else 0.0,
+                    })
+                    self._hspec_gen_timing = td
+                    logger.warning(
+                        "HSPEC GEN proposer_breakdown [req_idx=%d] req_id=%s prompt_id=%s decoded_len=%d "
+                        "status=no_pending skip_reason=%s timing_ms=%s",
+                        int(di),
+                        str(req_id),
+                        str(pid),
+                        int(decoded_len),
+                        str(trace_skip_reason),
+                        td,
+                    )
+                except Exception:
+                    pass
             if HSPEC_DEBUG:
                 logger.info("HSPEC DEBUG generate_token_ids(): no pending entries, all requests miss cache/anchor")
             return results
 
         # 4. Single device → host sync for the whole batch
-        sim_stack = torch.stack([p[1] for p in pending])    # (P,)
-        idx_stack = torch.stack([p[2] for p in pending])    # (P,)
-        sims_cpu = sim_stack.cpu().numpy()
-        idxs_cpu = idx_stack.cpu().numpy()
+        t0_stack = _now_ns() if gen_enabled else 0
+        with hspec_record_function("hspec/proposal/device_to_host_sync", use_npu_stream=True):
+            sim_stack = torch.stack([p[1] for p in pending])    # (P,)
+            idx_stack = torch.stack([p[2] for p in pending])    # (P,)
+            t1_stack = _now_ns() if gen_enabled else 0
+            t0_copy = _now_ns() if gen_enabled else 0
+            sims_cpu = sim_stack.cpu().numpy()
+            idxs_cpu = idx_stack.cpu().numpy()
+            t1_copy = _now_ns() if gen_enabled else 0
 
         # 5. Draft token retrieval (CPU-only, O(1) per request)
         for j, (i, _, _, cached) in enumerate(pending):
+            t0_retrieve = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
             if sims_cpu[j] < self.similarity_threshold:
                 continue
 
@@ -834,17 +955,85 @@ class HSpecProposer(Proposer):
             cached.update_window(accept_len)
 
             # Draft tokens from CPU cache (sub-µs numpy slice)
-            draft = cached.get_draft_tokens(
-                int(idxs_cpu[j]), cached.wnd_size,
-            )
+            prof_this_req = prof_enabled
+            with (hspec_record_function("hspec/proposal/draft_retrieve")
+                  if prof_this_req else nullcontext()):
+                draft = cached.get_draft_tokens(
+                    int(idxs_cpu[j]), cached.wnd_size,
+                )
             if len(draft) > self.max_draft_tokens:
                 draft = draft[: self.max_draft_tokens]
             results[i] = draft
             self._stat_hits += 1
             self._stat_total_draft_len += len(draft)
+            t1_retrieve = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
+            if gen_enabled and i == gen_req_idx:
+                td = getattr(self, "_hspec_gen_timing", {}) if hasattr(self, "_hspec_gen_timing") else {}
+                td.update({
+                    "poll_pending_ms": _ns_to_ms(t1_poll - t0_poll) if t0_poll else 0.0,
+                    "fire_prefetch_async_ms": _ns_to_ms(t1_fire - t0_fire) if t0_fire else 0.0,
+                    "stack_scalars_ms": _ns_to_ms(t1_stack - t0_stack) if t0_stack else 0.0,
+                    "device_to_host_ms": _ns_to_ms(t1_copy - t0_copy) if t0_copy else 0.0,
+                    "draft_retrieve_ms": _ns_to_ms(t1_retrieve - t0_retrieve) if t0_retrieve else 0.0,
+                })
+                self._hspec_gen_timing = td
 
         self._stat_queries += len(pending)
         self._maybe_log_metrics()
+
+        # HSPEC_GEN: per-token breakdown log for one traced request only.
+        # We intentionally log at WARNING to make sure it lands in the main
+        # training output when log levels filter INFO.
+        if gen_enabled and batch_size > 0:
+            di = min(gen_req_idx, batch_size - 1)
+            try:
+                req_id = input_batch.req_ids[di]
+                req_state = self.runner.requests.get(req_id)
+                decoded_len = len(getattr(req_state, "output_token_ids", [])) if req_state is not None else -1
+                pid = prompt_ids[di] if di < len(prompt_ids) else ""
+                anchor = anchor_list[di] if di < len(anchor_list) else None
+                anchor_norm = None
+                if anchor is not None:
+                    try:
+                        anchor_norm = float(anchor.float().norm().item())
+                    except Exception:
+                        anchor_norm = None
+
+                # Similarity info (if this request is in pending)
+                sim_val = None
+                best_idx_val = None
+                n_entries = None
+                wnd_size = None
+                if trace_pending_j is not None:
+                    # Find the pending slot for this batch index
+                    if trace_pending_j < len(pending) and pending[trace_pending_j][0] == di:
+                        sim_val = float(sims_cpu[trace_pending_j])
+                        best_idx_val = int(idxs_cpu[trace_pending_j])
+                        n_entries = int(pending[trace_pending_j][3].n_entries)
+                        wnd_size = int(pending[trace_pending_j][3].wnd_size)
+
+                draft = results[di] if di < len(results) else []
+                td = getattr(self, "_hspec_gen_timing", {}) if hasattr(self, "_hspec_gen_timing") else {}
+                logger.warning(
+                    "HSPEC GEN proposer_breakdown [req_idx=%d] req_id=%s prompt_id=%s decoded_len=%d "
+                    "anchor_norm=%s sim=%s best_idx=%s n_entries=%s wnd_size=%s draft_len=%d draft=%s "
+                    "timing_ms=%s",
+                    int(di),
+                    str(req_id),
+                    str(pid),
+                    int(decoded_len),
+                    "None" if anchor_norm is None else f"{anchor_norm:.6f}",
+                    "None" if sim_val is None else f"{sim_val:.6f}",
+                    "None" if best_idx_val is None else str(best_idx_val),
+                    "None" if n_entries is None else str(n_entries),
+                    "None" if wnd_size is None else str(wnd_size),
+                    int(len(draft)),
+                    list(draft),
+                    td,
+                )
+            except Exception:
+                # Never break decoding due to debug logging.
+                pass
 
         if HSPEC_DEBUG:
             try:

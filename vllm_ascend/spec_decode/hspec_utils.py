@@ -18,13 +18,190 @@ This module provides helper functions for hidden state collection and processing
 """
 
 from typing import Optional, List, Tuple, Dict, Any
+from contextlib import contextmanager, nullcontext
 import logging
 import hashlib
+import os
 import struct
+import threading
 import torch
 import numpy as np
 
+try:
+    from torch.profiler import record_function as _record_function
+except Exception:  # pragma: no cover - fallback for older torch variants
+    from torch.autograd.profiler import record_function as _record_function
+
 logger = logging.getLogger(__name__)
+
+_hspec_profile_local = threading.local()
+
+
+def _parse_profile_steps(value: str) -> set[int]:
+    steps: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            steps.add(int(item))
+        except ValueError:
+            logger.warning("Ignoring invalid HSPEC_PROFILE_STEPS item: %s", item)
+    return steps
+
+
+def hspec_profile_enabled_for_step(global_step: Optional[int]) -> bool:
+    if os.getenv("HSPEC_PROFILE", "0") == "0":
+        return False
+    if global_step is None:
+        return False
+    steps = _parse_profile_steps(os.getenv("HSPEC_PROFILE_STEPS", "5,31"))
+    return int(global_step) in steps
+
+
+def hspec_profile_req_idx() -> int:
+    return -1
+
+
+def hspec_profile_output_dir() -> str:
+    return os.getenv("HSPEC_PROFILE_DIR", "/workspace/exp/hspec_npu_profile")
+
+
+def hspec_profile_with_stack() -> bool:
+    return os.getenv("HSPEC_PROFILE_WITH_STACK", "0") != "0"
+
+
+def hspec_profile_memory() -> bool:
+    return os.getenv("HSPEC_PROFILE_MEMORY", "0") != "0"
+
+
+def hspec_profile_analyse_flag() -> bool:
+    return os.getenv("HSPEC_PROFILE_ANALYSE", "1") != "0"
+
+
+def hspec_profile_method() -> str:
+    return os.getenv("HSPEC_PROFILE_METHOD", "mstx").strip().lower()
+
+
+def hspec_profile_domain() -> str:
+    return os.getenv("HSPEC_PROFILE_DOMAIN", "hspec")
+
+
+def hspec_profile_context_enabled() -> bool:
+    return bool(getattr(_hspec_profile_local, "enabled", False))
+
+
+def hspec_profile_context_step() -> Optional[int]:
+    return getattr(_hspec_profile_local, "step", None)
+
+
+def hspec_profile_context_req_idx() -> int:
+    return int(getattr(_hspec_profile_local, "req_idx", -1))
+
+
+def hspec_set_profile_context(enabled: bool, step: Optional[int], req_idx: int) -> None:
+    _hspec_profile_local.enabled = bool(enabled)
+    _hspec_profile_local.step = step
+    _hspec_profile_local.req_idx = int(req_idx)
+
+
+def hspec_clear_profile_context() -> None:
+    _hspec_profile_local.enabled = False
+    _hspec_profile_local.step = None
+    _hspec_profile_local.req_idx = -1
+
+
+@contextmanager
+def hspec_record_function(name: str, use_npu_stream: bool = False):
+    if not hspec_profile_context_enabled():
+        with nullcontext():
+            yield
+        return
+
+    method = hspec_profile_method()
+    if method == "mstx":
+        try:
+            import torch_npu
+
+            stream = torch_npu.npu.current_stream() if use_npu_stream else None
+            domain = hspec_profile_domain()
+            range_id = torch_npu.npu.mstx.range_start(name, stream, domain=domain)
+            try:
+                yield
+            finally:
+                torch_npu.npu.mstx.range_end(range_id, domain=domain)
+            return
+        except Exception:
+            # Fallback to record_function if mstx is unavailable.
+            pass
+
+    with _record_function(name):
+        yield
+
+
+def create_hspec_torch_npu_profiler(profile_dir: str):
+    import torch_npu
+
+    level_name = os.getenv(
+        "HSPEC_PROFILE_LEVEL",
+        "level_none" if hspec_profile_method() == "mstx" else "level1",
+    ).lower()
+    if level_name == "level0":
+        level = torch_npu.profiler.ProfilerLevel.Level0
+    elif level_name == "level1":
+        level = torch_npu.profiler.ProfilerLevel.Level1
+    elif level_name == "level2":
+        level = torch_npu.profiler.ProfilerLevel.Level2
+    elif level_name == "level_none":
+        level = torch_npu.profiler.ProfilerLevel.Level_none
+    else:
+        raise ValueError(f"Unsupported HSPEC_PROFILE_LEVEL: {level_name}")
+
+    use_mstx = hspec_profile_method() == "mstx"
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        export_type=(
+            [torch_npu.profiler.ExportType.Db]
+            if use_mstx
+            else [torch_npu.profiler.ExportType.Text]
+        ),
+        profiler_level=level,
+        mstx=use_mstx,
+        mstx_domain_include=["default", hspec_profile_domain()] if use_mstx else [],
+        mstx_domain_exclude=[],
+        aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+        l2_cache=False,
+        op_attr=False,
+        data_simplification=False if use_mstx else True,
+        record_op_args=False,
+        gc_detect_threshold=None,
+        host_sys=[],
+        sys_io=False,
+        sys_interconnection=False,
+    )
+
+    return torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.CPU,
+            torch_npu.profiler.ProfilerActivity.NPU,
+        ],
+        schedule=torch_npu.profiler.schedule(
+            wait=0,
+            warmup=0,
+            active=1,
+            repeat=1,
+            skip_first=0,
+        ),
+        with_stack=hspec_profile_with_stack(),
+        profile_memory=hspec_profile_memory(),
+        with_modules=False,
+        record_shapes=False,
+        with_flops=False,
+        experimental_config=experimental_config,
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+            profile_dir,
+            analyse_flag=hspec_profile_analyse_flag(),
+        ),
+    )
 
 
 def prompt_id_from_token_ids(prompt_token_ids: List[int]) -> str:
