@@ -245,6 +245,18 @@ class HSpecTableGroup:
         self._verify_count = 0
         self._accept_count = 0
         self._accept_len_sum = 0
+        self._accept_advan_count = 0
+        # Entry-position study metrics (reported asynchronously from the
+        # worker-local proposer).
+        self._entry_match_count = 0
+        self._entry_delta_sum = 0
+        self._entry_abs_delta_sum = 0
+        self._entry_verify_count = 0
+        self._entry_accept_count = 0
+        self._entry_accept_len_sum = 0
+        self._entry_abs_delta_verify: Dict[int, int] = {}
+        self._entry_abs_delta_accept: Dict[int, int] = {}
+        self._entry_abs_delta_accept_len_sum: Dict[int, int] = {}
 
         # ZMQ state
         self.running = False
@@ -504,18 +516,32 @@ class HSpecTableGroup:
     # Metrics
 
     def compute_metrics(self) -> Dict[str, float]:
-        return {
+        metrics: Dict[str, float] = {
             "query_times": self._query_count,
             "match_times": self._match_count,
             "total_draft_length": self._total_draft_len,
             "verify_times": self._verify_count,
             "accept_times": self._accept_count,
             "accept_length_sum": self._accept_len_sum,
+            "accept_times_advan": self._accept_advan_count,
             "build_count": self._build_count,
             "discard_count": self._discard_count,
             "num_prompts": len(self._active),
             "total_entries": self.total_entries(),
+            "entry_match_count": self._entry_match_count,
+            "entry_delta_sum": self._entry_delta_sum,
+            "entry_abs_delta_sum": self._entry_abs_delta_sum,
+            "entry_verify_count": self._entry_verify_count,
+            "entry_accept_count": self._entry_accept_count,
+            "entry_accept_len_sum": self._entry_accept_len_sum,
         }
+        for abs_delta, count in self._entry_abs_delta_verify.items():
+            metrics[f"entry_abs_delta_verify_{abs_delta}"] = float(count)
+        for abs_delta, count in self._entry_abs_delta_accept.items():
+            metrics[f"entry_abs_delta_accept_{abs_delta}"] = float(count)
+        for abs_delta, total_len in self._entry_abs_delta_accept_len_sum.items():
+            metrics[f"entry_abs_delta_accept_len_sum_{abs_delta}"] = float(total_len)
+        return metrics
 
     def _reset_metrics(self):
         self._query_count = 0
@@ -526,6 +552,16 @@ class HSpecTableGroup:
         self._verify_count = 0
         self._accept_count = 0
         self._accept_len_sum = 0
+        self._accept_advan_count = 0
+        self._entry_match_count = 0
+        self._entry_delta_sum = 0
+        self._entry_abs_delta_sum = 0
+        self._entry_verify_count = 0
+        self._entry_accept_count = 0
+        self._entry_accept_len_sum = 0
+        self._entry_abs_delta_verify = {}
+        self._entry_abs_delta_accept = {}
+        self._entry_abs_delta_accept_len_sum = {}
 
     # Online metrics reporting (from worker-local proposer)
 
@@ -556,6 +592,7 @@ class HSpecTableGroup:
         verify_times: int = 0,
         accept_times: int = 0,
         accept_length_sum: int = 0,
+        accept_times_advan: int = 0,
     ) -> None:
         """Accumulate post-verification stats (after rejection sampling).
 
@@ -566,6 +603,49 @@ class HSpecTableGroup:
             self._verify_count += int(verify_times)
             self._accept_count += int(accept_times)
             self._accept_len_sum += int(accept_length_sum)
+            self._accept_advan_count += int(accept_times_advan)
+        except Exception:
+            pass
+
+    def report_entry_metrics(
+        self,
+        match_count: int = 0,
+        delta_sum: int = 0,
+        abs_delta_sum: int = 0,
+        verify_count: int = 0,
+        accept_count: int = 0,
+        accept_len_sum: int = 0,
+        abs_delta_verify: Optional[Dict[int, int]] = None,
+        abs_delta_accept: Optional[Dict[int, int]] = None,
+        abs_delta_accept_len_sum: Optional[Dict[int, int]] = None,
+    ) -> None:
+        """Aggregate entry-position study metrics from worker-local proposers."""
+        try:
+            self._entry_match_count += int(match_count)
+            self._entry_delta_sum += int(delta_sum)
+            self._entry_abs_delta_sum += int(abs_delta_sum)
+            self._entry_verify_count += int(verify_count)
+            self._entry_accept_count += int(accept_count)
+            # Global entry_avg_accept_length uses verify_count as denominator,
+            # so this sum is over *all* verified drafts' accepted_prefix_len.
+            self._entry_accept_len_sum += int(accept_len_sum)
+
+            for abs_delta, count in (abs_delta_verify or {}).items():
+                key = int(abs_delta)
+                self._entry_abs_delta_verify[key] = (
+                    self._entry_abs_delta_verify.get(key, 0) + int(count)
+                )
+            for abs_delta, count in (abs_delta_accept or {}).items():
+                key = int(abs_delta)
+                self._entry_abs_delta_accept[key] = (
+                    self._entry_abs_delta_accept.get(key, 0) + int(count)
+                )
+            for abs_delta, total_len in (abs_delta_accept_len_sum or {}).items():
+                key = int(abs_delta)
+                self._entry_abs_delta_accept_len_sum[key] = (
+                    self._entry_abs_delta_accept_len_sum.get(key, 0)
+                    + int(total_len)
+                )
         except Exception:
             pass
 
@@ -756,6 +836,7 @@ class GlobalHSpecTableGroup:
         verify_times: int,
         accept_times: int,
         accept_length_sum: int,
+        accept_times_advan: int = 0,
     ) -> Optional[ray.ObjectRef]:
         """Fire-and-forget reporting of verification stats from vLLM workers."""
         if not self.groups:
@@ -766,6 +847,37 @@ class GlobalHSpecTableGroup:
                 verify_times=verify_times,
                 accept_times=accept_times,
                 accept_length_sum=accept_length_sum,
+                accept_times_advan=accept_times_advan,
+            )
+        except Exception:
+            return None
+
+    def report_entry_metrics_async(
+        self,
+        match_count: int,
+        delta_sum: int,
+        abs_delta_sum: int,
+        verify_count: int,
+        accept_count: int,
+        accept_len_sum: int,
+        abs_delta_verify: Dict[int, int],
+        abs_delta_accept: Dict[int, int],
+        abs_delta_accept_len_sum: Dict[int, int],
+    ) -> Optional[ray.ObjectRef]:
+        """Fire-and-forget reporting for entry-position study metrics."""
+        if not self.groups:
+            return None
+        try:
+            return self.groups[0].report_entry_metrics.remote(
+                match_count=match_count,
+                delta_sum=delta_sum,
+                abs_delta_sum=abs_delta_sum,
+                verify_count=verify_count,
+                accept_count=accept_count,
+                accept_len_sum=accept_len_sum,
+                abs_delta_verify=abs_delta_verify,
+                abs_delta_accept=abs_delta_accept,
+                abs_delta_accept_len_sum=abs_delta_accept_len_sum,
             )
         except Exception:
             return None
@@ -1032,13 +1144,21 @@ class GlobalHSpecTableGroup:
                 "hspec/discard_count": 0,
                 "hspec/num_prompts": 0,
                 "hspec/total_entries": 0,
+                "hspec/accept_times_advan": 0,
+                "hspec/accept_times_advan_ratio": 0.0,
+                "hspec/entry_match_avg_signed_delta": 0.0,
+                "hspec/entry_match_avg_abs_delta": 0.0,
+                "hspec/entry_verify_times": 0,
+                "hspec/entry_accept_times": 0,
+                "hspec/entry_avg_accept_length": 0.0,
             }
         tasks = [g.compute_metrics.remote() for g in self.groups]
         metrics_list = ray.get(tasks)
 
         agg: Dict[str, float] = {}
-        for key in metrics_list[0]:
-            agg[key] = sum(float(m[key]) for m in metrics_list)
+        for metrics in metrics_list:
+            for key, value in metrics.items():
+                agg[key] = agg.get(key, 0.0) + float(value)
 
         # Cache-match metrics (reported from worker-local proposer).
         cache_qt = agg.get("query_times", 0)
@@ -1048,7 +1168,15 @@ class GlobalHSpecTableGroup:
         vt = agg.get("verify_times", 0)
         at = agg.get("accept_times", 0)
         als = agg.get("accept_length_sum", 0)
-        return {
+        ata = agg.get("accept_times_advan", 0)
+        entry_match_count = agg.get("entry_match_count", 0)
+        entry_delta_sum = agg.get("entry_delta_sum", 0)
+        entry_abs_delta_sum = agg.get("entry_abs_delta_sum", 0)
+        entry_verify_count = agg.get("entry_verify_count", 0)
+        entry_accept_count = agg.get("entry_accept_count", 0)
+        entry_accept_len_sum = agg.get("entry_accept_len_sum", 0)
+
+        result = {
             # User-intended definition: accept_len>=1 probability after rejection sampling.
             "hspec/match_rate": at / vt if vt > 0 else 0.0,
             "hspec/avg_accept_length": als / at if at > 0 else 0.0,
@@ -1067,7 +1195,53 @@ class GlobalHSpecTableGroup:
             "hspec/discard_count": agg.get("discard_count", 0),
             "hspec/num_prompts": agg.get("num_prompts", 0),
             "hspec/total_entries": agg.get("total_entries", 0),
+            "hspec/accept_times_advan": ata,
+            "hspec/accept_times_advan_ratio": (
+                ata / at if at > 0 else 0.0
+            ),
+            # Entry-position study summaries.
+            "hspec/entry_match_avg_signed_delta": (
+                entry_delta_sum / entry_match_count
+                if entry_match_count > 0 else 0.0
+            ),
+            "hspec/entry_match_avg_abs_delta": (
+                entry_abs_delta_sum / entry_match_count
+                if entry_match_count > 0 else 0.0
+            ),
+            "hspec/entry_verify_times": entry_verify_count,
+            "hspec/entry_accept_times": entry_accept_count,
+            "hspec/entry_avg_accept_length": (
+                entry_accept_len_sum / entry_verify_count
+                if entry_verify_count > 0 else 0.0
+            ),
         }
+
+        abs_deltas = set()
+        for key in agg:
+            if key.startswith("entry_abs_delta_verify_"):
+                abs_deltas.add(int(key.rsplit("_", 1)[-1]))
+            elif key.startswith("entry_abs_delta_accept_"):
+                abs_deltas.add(int(key.rsplit("_", 1)[-1]))
+            elif key.startswith("entry_abs_delta_accept_len_sum_"):
+                abs_deltas.add(int(key.rsplit("_", 1)[-1]))
+
+        for abs_delta in sorted(abs_deltas):
+            verify_count = agg.get(f"entry_abs_delta_verify_{abs_delta}", 0.0)
+            accept_count = agg.get(f"entry_abs_delta_accept_{abs_delta}", 0.0)
+            accept_len_total = agg.get(
+                f"entry_abs_delta_accept_len_sum_{abs_delta}", 0.0,
+            )
+            prefix = f"hspec/entry_abs_delta_{abs_delta}"
+            result[f"{prefix}_verify_times"] = verify_count
+            result[f"{prefix}_accept_times"] = accept_count
+            result[f"{prefix}_match_rate"] = (
+                accept_count / verify_count if verify_count > 0 else 0.0
+            )
+            result[f"{prefix}_avg_accept_length"] = (
+                accept_len_total / accept_count if accept_count > 0 else 0.0
+            )
+
+        return result
 
     # ZMQ helpers
 

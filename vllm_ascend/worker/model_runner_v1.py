@@ -434,6 +434,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self._hspec_verify_pending_verify = 0
         self._hspec_verify_pending_accept = 0
         self._hspec_verify_pending_accept_len_sum = 0
+        self._hspec_verify_pending_accept_advan = 0
 
         # kv role
         self.is_kv_producer = False
@@ -623,11 +624,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         verify_times: int,
         accept_times: int,
         accept_length_sum: int,
+        accept_times_advan: int = 0,
     ) -> None:
         """Best-effort, low-frequency metrics reporting (never block hot loop)."""
         if not self._hspec_verify_metrics_enabled:
             return
-        if verify_times <= 0 and accept_times <= 0 and accept_length_sum <= 0:
+        if (verify_times <= 0 and accept_times <= 0
+                and accept_length_sum <= 0 and accept_times_advan <= 0):
             return
         # Only meaningful for HSPEC.
         if not self._hspec_collect:
@@ -637,6 +640,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self._hspec_verify_pending_verify += int(verify_times)
         self._hspec_verify_pending_accept += int(accept_times)
         self._hspec_verify_pending_accept_len_sum += int(accept_length_sum)
+        if not hasattr(self, "_hspec_verify_pending_accept_advan"):
+            self._hspec_verify_pending_accept_advan = 0
+        self._hspec_verify_pending_accept_advan += int(accept_times_advan)
 
         if self._hspec_verify_report_every_calls <= 1:
             should_flush = True
@@ -651,7 +657,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         vt = int(self._hspec_verify_pending_verify)
         at = int(self._hspec_verify_pending_accept)
         als = int(self._hspec_verify_pending_accept_len_sum)
-        if vt <= 0 and at <= 0 and als <= 0:
+        ata = int(getattr(self, "_hspec_verify_pending_accept_advan", 0))
+        if vt <= 0 and at <= 0 and als <= 0 and ata <= 0:
             return
 
         # Report to the same global table group used by the HSPEC proposer.
@@ -659,10 +666,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if tables is None or not hasattr(tables, "report_verification_metrics_async"):
             return
         try:
-            tables.report_verification_metrics_async(vt, at, als)
+            tables.report_verification_metrics_async(vt, at, als, ata)
             self._hspec_verify_pending_verify = 0
             self._hspec_verify_pending_accept = 0
             self._hspec_verify_pending_accept_len_sum = 0
+            self._hspec_verify_pending_accept_advan = 0
         except Exception:
             # Swallow all errors; metrics must never affect decoding.
             pass
@@ -2001,6 +2009,37 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         sample_hidden_states[bonus_idx].clone().half())
                 # else: has draft tokens → skip (design-doc fallback)
 
+    def _hspec_compute_accepted_prefix_lengths(
+        self,
+        scheduler_output: "SchedulerOutput",
+        valid_sampled_token_ids: list[list[int]],
+    ) -> list[int]:
+        """Return per-request accepted draft-prefix lengths.
+
+        For each request, this is the longest prefix length such that
+        ``out[:prefix] == draft[:prefix]`` where ``draft`` is the spec tokens
+        scheduled for this step and ``out`` is the final rejection-sampled
+        output list for this step.
+        """
+        accepted_prefix_lengths: list[int] = [0] * len(self.input_batch.req_ids)
+        scheduled = scheduler_output.scheduled_spec_decode_tokens
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            draft = scheduled.get(req_id, [])
+            if not draft:
+                continue
+            out = (
+                valid_sampled_token_ids[i]
+                if i < len(valid_sampled_token_ids) else []
+            )
+            accepted = 0
+            for p in range(min(len(draft), len(out))):
+                if int(out[p]) == int(draft[p]):
+                    accepted += 1
+                else:
+                    break
+            accepted_prefix_lengths[i] = int(accepted)
+        return accepted_prefix_lengths
+
     def propose_draft_token_ids(
         self,
         valid_sampled_token_ids: list[list[int]],
@@ -2618,35 +2657,56 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         except Exception:
                             pass
 
+                accepted_prefix_lengths = [0] * len(self.input_batch.req_ids)
+                if spec_decode_metadata is not None and max_gen_len > 1:
+                    accepted_prefix_lengths = (
+                        self._hspec_compute_accepted_prefix_lengths(
+                            scheduler_output,
+                            valid_sampled_token_ids,
+                        )
+                    )
+
                 # HSpec verification metrics (post rejection-sampling).
                 # We compute on CPU lists (valid_sampled_token_ids) to avoid
                 # introducing extra device sync.
+                accept_advan_add = 0
+                if (not self.use_async_scheduling
+                        and self.drafter is not None
+                        and getattr(self.drafter, "name", None) == SpecDcodeType.HSPEC
+                        and hasattr(self.drafter, "update_verification_outcomes")
+                        and spec_decode_metadata is not None
+                        and max_gen_len > 1):
+                    try:
+                        n = min(len(self.input_batch.req_ids), len(accepted_prefix_lengths))
+                        accept_advan_add = int(self.drafter.update_verification_outcomes(
+                            self.input_batch.req_ids[:n],
+                            accepted_prefix_lengths[:n],
+                        ))
+                    except Exception:
+                        accept_advan_add = 0
+
                 if (self._hspec_collect and self._hspec_verify_metrics_enabled
                         and spec_decode_metadata is not None
                         and max_gen_len > 1):
                     try:
-                        scheduled = scheduler_output.scheduled_spec_decode_tokens
                         verify_add = 0
                         accept_add = 0
                         accept_len_add = 0
                         for i, req_id in enumerate(self.input_batch.req_ids):
-                            draft = scheduled.get(req_id, [])
+                            draft = scheduler_output.scheduled_spec_decode_tokens.get(req_id, [])
                             if not draft:
                                 continue
                             verify_add += 1
-                            out = (valid_sampled_token_ids[i]
-                                   if i < len(valid_sampled_token_ids) else [])
-                            accepted = 0
-                            for p in range(min(len(draft), len(out))):
-                                if int(out[p]) == int(draft[p]):
-                                    accepted += 1
-                                else:
-                                    break
+                            accepted = (
+                                accepted_prefix_lengths[i]
+                                if i < len(accepted_prefix_lengths) else 0
+                            )
                             if accepted >= 1:
                                 accept_add += 1
                                 accept_len_add += int(accepted)
                         self._hspec_maybe_report_verification_metrics(
-                            verify_add, accept_add, accept_len_add)
+                            verify_add, accept_add, accept_len_add,
+                            accept_advan_add)
                     except Exception:
                         pass
                 # Mask out the sampled tokens that should not be sampled.

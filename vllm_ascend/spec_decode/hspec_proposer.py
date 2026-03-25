@@ -19,7 +19,7 @@ HSpec Proposer – on-device hidden-state similarity speculative decoding.
 import logging
 import os
 import time
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Set
 
@@ -59,6 +59,9 @@ HSPEC_GEN_REQ_IDX = int(os.getenv("HSPEC_GEN_REQ_IDX",
                                   os.getenv("HSPEC_DEBUG_REQ_IDX", "3")))
 HSPEC_GEN_MAX_CALLS = int(os.getenv("HSPEC_GEN_MAX_CALLS", "0"))  # 0 = no limit
 
+# HistoSpec-comparison study: compare against an exact n-gram match baseline.
+HSPEC_ADVAN_NGRAM = int(os.getenv("HSPEC_ADVAN_NGRAM", "3"))
+
 
 def _now_ns() -> int:
     # perf_counter_ns is monotonic and high resolution; safe for timings.
@@ -82,6 +85,7 @@ class _CachedPromptTable:
     __slots__ = (
         "mean", "components", "keys",
         "rollout_seqs", "entry_rollout_idx", "entry_offset",
+        "rollout_entry_starts", "rollout_entry_lens",
         "n_entries",
         "wnd_size", "max_wnd", "min_wnd",
     )
@@ -94,6 +98,8 @@ class _CachedPromptTable:
         rollout_seqs: list,
         entry_rollout_idx: np.ndarray,
         entry_offset: np.ndarray,
+        rollout_entry_starts: np.ndarray,
+        rollout_entry_lens: np.ndarray,
         n_entries: int,
         wnd_size: int = 8,
         max_wnd: int = 28,
@@ -105,6 +111,8 @@ class _CachedPromptTable:
         self.rollout_seqs = rollout_seqs              # list[np.ndarray int32], CPU
         self.entry_rollout_idx = entry_rollout_idx    # (M,) int32, CPU
         self.entry_offset = entry_offset              # (M,) int32, CPU
+        self.rollout_entry_starts = rollout_entry_starts  # (R,) int32, CPU
+        self.rollout_entry_lens = rollout_entry_lens      # (R,) int32, CPU
         self.n_entries = n_entries
         self.wnd_size = wnd_size
         self.max_wnd = max_wnd
@@ -290,7 +298,16 @@ class HSpecProposer(Proposer):
 
         # Accept-length tracking (adaptive window control)
         self._accept_lengths: Dict[str, int] = {}
-
+        # req_id -> matched entry metadata for the *next* verification step.
+        self._pending_verify_meta: Dict[str, Dict[str, int]] = {}
+        # req_id -> stable prompt_id cache to avoid repeated hashing of the
+        # same prompt token ids across decode steps for a live request.
+        self._req_prompt_ids: Dict[str, str] = {}
+        # Batch-aligned prompt-id cache. prefetch_for_batch() runs before every
+        # forward pass, so generate_token_ids() can usually reuse this exact
+        # alignment with just a req-id tuple comparison.
+        self._cached_batch_req_ids: tuple[str, ...] = ()
+        self._cached_batch_prompt_ids: List[str] = []
         # Lightweight local metrics (for functional + perf validation).
         # These live in the vLLM worker process; we never RPC in the hot loop.
         self._stat_calls = 0
@@ -313,9 +330,21 @@ class HSpecProposer(Proposer):
         self._reported_hits = 0
         self._reported_total_draft_len = 0
 
+        # Entry-position study buffers. These are flushed asynchronously to the
+        # global HSpec table actors at low frequency.
+        self._entry_pending_match_count = 0
+        self._entry_pending_delta_sum = 0
+        self._entry_pending_abs_delta_sum = 0
+        self._entry_pending_verify_count = 0
+        self._entry_pending_accept_count = 0
+        self._entry_pending_accept_len_sum = 0
+        self._entry_pending_abs_delta_verify = defaultdict(int)
+        self._entry_pending_abs_delta_accept = defaultdict(int)
+        self._entry_pending_abs_delta_accept_len_sum = defaultdict(int)
+
         logger.info(
             "HSpec proposer initialised: threshold=%.3f, "
-            "max_draft=%d, cache_cap=%d",
+            "max_draft=%d, cache_cap=%d, fully_batched_match=1",
             self.similarity_threshold,
             self.max_draft_tokens,
             self._max_cache_size,
@@ -334,14 +363,8 @@ class HSpecProposer(Proposer):
         If a prompt is not ready yet, ``generate_token_ids()`` simply
         returns ``draft=[]`` for that request (graceful degradation).
         """
-        # Convert req_ids → prompt_ids
-        prompt_ids: List[str] = []
-        for req_id in req_ids:
-            req_state = self.runner.requests.get(req_id)
-            if req_state is not None:
-                prompt_ids.append(
-                    prompt_id_from_token_ids(req_state.prompt_token_ids),
-                )
+        prompt_ids = self._get_prompt_ids_for_batch(req_ids)
+        prompt_ids = [pid for pid in prompt_ids if pid]
         if not prompt_ids:
             return
 
@@ -452,6 +475,34 @@ class HSpecProposer(Proposer):
         except Exception:
             logger.debug("HSpec: async prefetch fire failed", exc_info=True)
 
+    def _get_or_create_prompt_id(self, req_id: str) -> str:
+        """Return a stable prompt_id for a live request, caching by req_id."""
+        cached = self._req_prompt_ids.get(req_id)
+        if cached is not None:
+            return cached
+
+        req_state = self.runner.requests.get(req_id)
+        if req_state is None:
+            return ""
+
+        prompt_id = prompt_id_from_token_ids(req_state.prompt_token_ids)
+        self._req_prompt_ids[req_id] = prompt_id
+        return prompt_id
+
+    def _get_prompt_ids_for_batch(self, req_ids: List[str]) -> List[str]:
+        """Return prompt_ids aligned to the current scheduled batch."""
+        batch_req_ids = tuple(str(req_id) for req_id in req_ids)
+        if batch_req_ids == self._cached_batch_req_ids:
+            return self._cached_batch_prompt_ids
+
+        prompt_ids = [
+            self._get_or_create_prompt_id(req_id)
+            for req_id in batch_req_ids
+        ]
+        self._cached_batch_req_ids = batch_req_ids
+        self._cached_batch_prompt_ids = prompt_ids
+        return prompt_ids
+
     def _maybe_log_metrics(self) -> None:
         """Best-effort periodic metrics log (no blocking, minimal overhead)."""
         self._stat_calls += 1
@@ -469,6 +520,7 @@ class HSpecProposer(Proposer):
             if self._stat_accept_count > 0
             else 0.0
         )
+        '''
         logger.info(
             "HSpec online metrics: queries=%d hits=%d match_rate=%.3f "
             "avg_draft_len=%.2f avg_accept_len=%.2f cache_size=%d "
@@ -484,6 +536,7 @@ class HSpecProposer(Proposer):
             int(self._stat_prefetch_ready),
             int(self._cache_version),
         )
+        '''
 
         # Also report stats to the global table group at low frequency so the
         # trainer can observe match_rate/avg_draft_len even when queries are
@@ -499,7 +552,15 @@ class HSpecProposer(Proposer):
         dq = int(self._stat_queries - self._reported_queries)
         dh = int(self._stat_hits - self._reported_hits)
         ddl = int(self._stat_total_draft_len - self._reported_total_draft_len)
-        if dq <= 0 and dh <= 0 and ddl <= 0:
+        has_entry_pending = (
+            self._entry_pending_match_count > 0
+            or self._entry_pending_verify_count > 0
+            or self._entry_pending_accept_count > 0
+            or bool(self._entry_pending_abs_delta_verify)
+            or bool(self._entry_pending_abs_delta_accept)
+            or bool(self._entry_pending_abs_delta_accept_len_sum)
+        )
+        if dq <= 0 and dh <= 0 and ddl <= 0 and not has_entry_pending:
             return
 
         self._reported_queries = int(self._stat_queries)
@@ -513,6 +574,58 @@ class HSpecProposer(Proposer):
         except Exception:
             # Swallow all errors; metrics must never affect decoding.
             pass
+
+        if has_entry_pending:
+            try:
+                if hasattr(self.hspec_tables, "report_entry_metrics_async"):
+                    self.hspec_tables.report_entry_metrics_async(
+                        match_count=int(self._entry_pending_match_count),
+                        delta_sum=int(self._entry_pending_delta_sum),
+                        abs_delta_sum=int(self._entry_pending_abs_delta_sum),
+                        verify_count=int(self._entry_pending_verify_count),
+                        accept_count=int(self._entry_pending_accept_count),
+                        accept_len_sum=int(self._entry_pending_accept_len_sum),
+                        abs_delta_verify=dict(self._entry_pending_abs_delta_verify),
+                        abs_delta_accept=dict(self._entry_pending_abs_delta_accept),
+                        abs_delta_accept_len_sum=dict(
+                            self._entry_pending_abs_delta_accept_len_sum
+                        ),
+                    )
+            except Exception:
+                pass
+            finally:
+                self._entry_pending_match_count = 0
+                self._entry_pending_delta_sum = 0
+                self._entry_pending_abs_delta_sum = 0
+                self._entry_pending_verify_count = 0
+                self._entry_pending_accept_count = 0
+                self._entry_pending_accept_len_sum = 0
+                self._entry_pending_abs_delta_verify.clear()
+                self._entry_pending_abs_delta_accept.clear()
+                self._entry_pending_abs_delta_accept_len_sum.clear()
+
+    @staticmethod
+    def _build_rollout_entry_spans(
+        entry_rollout_idx: np.ndarray,
+        n_entries: int,
+        num_rollouts: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build contiguous per-rollout entry spans for local-window matching."""
+        starts = np.zeros((num_rollouts,), dtype=np.int32)
+        lens = np.zeros((num_rollouts,), dtype=np.int32)
+        if n_entries <= 0 or num_rollouts <= 0:
+            return starts, lens
+
+        counts = np.bincount(
+            entry_rollout_idx[:n_entries],
+            minlength=num_rollouts,
+        ).astype(np.int32, copy=False)
+        cursor = 0
+        for ridx, count in enumerate(counts.tolist()):
+            starts[ridx] = cursor
+            lens[ridx] = count
+            cursor += count
+        return starts, lens
 
     def _build_cached_table(self, data: dict) -> _CachedPromptTable:
         """Convert serialised table data dict → on-device cached table."""
@@ -539,68 +652,201 @@ class HSpecProposer(Proposer):
             else:
                 rollout_seqs.append(np.asarray(s, dtype=np.int32))
 
+        entry_rollout_idx = np.asarray(
+            data["entry_rollout_idx"], dtype=np.int32,
+        )
+        n_entries = int(data["n_entries"])
+        rollout_entry_starts, rollout_entry_lens = self._build_rollout_entry_spans(
+            entry_rollout_idx,
+            n_entries,
+            len(rollout_seqs),
+        )
+
         return _CachedPromptTable(
             mean=mean,
             components=components,
             keys=keys,
             rollout_seqs=rollout_seqs,
-            entry_rollout_idx=np.asarray(
-                data["entry_rollout_idx"], dtype=np.int32,
-            ),
+            entry_rollout_idx=entry_rollout_idx,
             entry_offset=np.asarray(data["entry_offset"], dtype=np.int32),
-            n_entries=int(data["n_entries"]),
+            rollout_entry_starts=rollout_entry_starts,
+            rollout_entry_lens=rollout_entry_lens,
+            n_entries=n_entries,
             wnd_size=int(data.get("wnd_size", 8)),
             max_wnd=int(data.get("max_wnd", 28)),
             min_wnd=int(data.get("min_wnd", 2)),
         )
 
+    @staticmethod
+    def _window_base_pos(decoded_len: int) -> int:
+        # After accepting `decoded_len` response tokens, the next query uses the
+        # anchor at local key position `decoded_len - 1`.
+        return max(int(decoded_len) - 1, 0)
+
+    def _build_batched_table_tensors(
+        self,
+        cached_tables: List[_CachedPromptTable],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pack ragged per-prompt components/keys into padded batch tensors."""
+        num_rows = len(cached_tables)
+        if num_rows == 0:
+            empty = torch.empty((0,), dtype=dtype, device=device)
+            return empty, empty, torch.empty((0,), dtype=torch.long, device=device)
+
+        k_max = max(int(cached.components.shape[0]) for cached in cached_tables)
+        m_max = max(int(cached.n_entries) for cached in cached_tables)
+        hidden_dim = int(cached_tables[0].mean.shape[0])
+
+        comp_batch = torch.zeros(
+            (num_rows, k_max, hidden_dim),
+            dtype=dtype,
+            device=device,
+        )
+        keys_batch = torch.zeros(
+            (num_rows, m_max, k_max),
+            dtype=dtype,
+            device=device,
+        )
+        key_lengths = torch.empty(
+            (num_rows,),
+            dtype=torch.long,
+            device=device,
+        )
+
+        for row, cached in enumerate(cached_tables):
+            k_i = int(cached.components.shape[0])
+            m_i = int(cached.n_entries)
+            comp_batch[row, :k_i, :] = cached.components.to(dtype=dtype)
+            if m_i > 0:
+                keys_batch[row, :m_i, :k_i] = cached.keys[:m_i, :k_i].to(dtype=dtype)
+            key_lengths[row] = m_i
+
+        return comp_batch, keys_batch, key_lengths
+
+    def _match_projected_batch(
+        self,
+        batch_indices: List[int],
+        cached_tables: List[_CachedPromptTable],
+        z_batch: torch.Tensor,
+        keys_batch: torch.Tensor,
+        key_lengths: torch.Tensor,
+        decoded_lens: List[int],
+    ) -> List[tuple[int, torch.Tensor, torch.Tensor, _CachedPromptTable, int]]:
+        """Fully batched similarity matching with padding + mask over ragged M."""
+        if not batch_indices:
+            return []
+        sims = torch.bmm(keys_batch, z_batch.unsqueeze(-1)).squeeze(-1)
+        if keys_batch.shape[1] > 0:
+            positions = torch.arange(
+                keys_batch.shape[1], device=z_batch.device,
+            ).unsqueeze(0)
+            invalid_mask = positions >= key_lengths.unsqueeze(1)
+            sims = sims.masked_fill(invalid_mask, torch.finfo(sims.dtype).min)
+        best_sims, best_idxs = sims.max(dim=1)
+        return [
+            (
+                batch_idx,
+                best_sims[row],
+                best_idxs[row],
+                cached,
+                self._window_base_pos(decoded_lens[batch_idx]),
+            )
+            for row, (batch_idx, cached) in enumerate(zip(batch_indices, cached_tables))
+        ]
+
+    @staticmethod
+    def _has_same_histo_ngram(
+        current_tokens: List[int],
+        matched_seq: np.ndarray,
+        matched_pos: int,
+    ) -> bool:
+        """Whether HistoSpec could have matched using the same exact n-gram."""
+        n = int(HSPEC_ADVAN_NGRAM)
+        if n <= 0:
+            return False
+        if len(current_tokens) < n:
+            return False
+
+        hist_end = int(matched_pos) + 1
+        if hist_end < n:
+            return False
+
+        current_ngram = [int(x) for x in current_tokens[-n:]]
+        hist_ngram = matched_seq[hist_end - n:hist_end].tolist()
+        return current_ngram == [int(x) for x in hist_ngram]
+
     # anchor hidden-state extraction
 
     @staticmethod
-    def _extract_anchor_hs(
-        i: int,
+    def _extract_anchor_hs_batch(
         sample_hidden_states: torch.Tensor,
         valid_sampled_token_ids: List[List[int]],
         spec_decode_metadata: Optional[SpecDecodeMetadata],
-    ) -> Optional[torch.Tensor]:
-        """Return the correct anchor hidden state for request *i*.
+    ) -> tuple[torch.Tensor, List[int]]:
+        """Batch-extract all valid anchor hidden states in one gather."""
+        batch_size = len(valid_sampled_token_ids)
+        if batch_size == 0:
+            return sample_hidden_states[:0], []
 
-        Handles all spec-decode paths:
-        - Non-spec decode: ``sample_hidden_states[i]`` (1-to-1).
-        - Spec, no drafts:  ``sample_hidden_states[bonus_idx]``.
-        - Spec, drafts, all accepted:  bonus position.
-        - Spec, drafts, partially accepted:  last accepted draft pos.
-        """
+        device = sample_hidden_states.device
+        accept_lens = torch.tensor(
+            [len(sampled_ids) for sampled_ids in valid_sampled_token_ids],
+            dtype=torch.long,
+            device=device,
+        )
+        anchor_indices = torch.full_like(accept_lens, -1)
+
         if spec_decode_metadata is None:
-            # Non-spec-decode: simple 1-to-1 mapping
-            if i < sample_hidden_states.shape[0]:
-                return sample_hidden_states[i]
-            return None
+            candidate_indices = torch.arange(
+                batch_size, dtype=torch.long, device=device,
+            )
+            valid_mask = (
+                (accept_lens > 0)
+                & (candidate_indices < sample_hidden_states.shape[0])
+            )
+            anchor_indices[valid_mask] = candidate_indices[valid_mask]
+        else:
+            num_drafts = torch.as_tensor(
+                spec_decode_metadata.num_draft_tokens[:batch_size],
+                dtype=torch.long,
+                device=device,
+            )
+            bonus_indices = spec_decode_metadata.bonus_logits_indices[
+                :batch_size
+            ].to(device=device, dtype=torch.long)
 
-        num_drafts = spec_decode_metadata.num_draft_tokens[i]
-        bonus_idx = spec_decode_metadata.bonus_logits_indices[i]
-        if isinstance(bonus_idx, torch.Tensor):
-            bonus_idx = bonus_idx.item()
+            has_accept = accept_lens > 0
+            no_draft = num_drafts == 0
+            has_draft = num_drafts > 0
+            full_accept = has_draft & (accept_lens >= (num_drafts + 1))
+            partial_accept = has_draft & has_accept & (~full_accept)
 
-        if num_drafts == 0:
-            # No drafts → bonus position == normal decode position
-            if 0 <= bonus_idx < sample_hidden_states.shape[0]:
-                return sample_hidden_states[bonus_idx]
-            return None
+            anchor_indices[has_accept & no_draft] = bonus_indices[
+                has_accept & no_draft
+            ]
+            anchor_indices[full_accept] = bonus_indices[full_accept]
+            anchor_indices[partial_accept] = (
+                bonus_indices[partial_accept]
+                - num_drafts[partial_accept]
+                + accept_lens[partial_accept]
+                - 1
+            )
 
-        # Has drafts → determine from accept length
-        accept_len = len(valid_sampled_token_ids[i])
-        if accept_len >= num_drafts + 1:
-            # All accepted + bonus → use bonus position
-            if 0 <= bonus_idx < sample_hidden_states.shape[0]:
-                return sample_hidden_states[bonus_idx]
-        elif accept_len > 0:
-            # Partially accepted → last accepted draft position
-            # Draft positions: [bonus_idx - num_drafts .. bonus_idx - 1]
-            last_idx = bonus_idx - num_drafts + accept_len - 1
-            if 0 <= last_idx < sample_hidden_states.shape[0]:
-                return sample_hidden_states[last_idx]
-        return None
+            valid_mask = (
+                (anchor_indices >= 0)
+                & (anchor_indices < sample_hidden_states.shape[0])
+            )
+
+        if not torch.any(valid_mask):
+            return sample_hidden_states[:0], []
+
+        gathered = sample_hidden_states.index_select(0, anchor_indices[valid_mask])
+        valid_batch_indices = torch.nonzero(
+            valid_mask, as_tuple=False,
+        ).flatten().tolist()
+        return gathered, valid_batch_indices
 
     # main interface
     
@@ -647,53 +893,52 @@ class HSpecProposer(Proposer):
                 gen_enabled = False
         prof_enabled = hspec_profile_context_enabled()
 
-        # 1. Stable prompt_id + anchor hidden state per request
-        prompt_ids: List[str] = []
-        anchor_list: List[Optional[torch.Tensor]] = []
+        # 1. Stable prompt_id + batch anchor hidden states
+        req_ids = list(input_batch.req_ids[:batch_size])
+        req_states = [self.runner.requests.get(req_id) for req_id in req_ids]
 
-        for i in range(batch_size):
-            t0_anchor = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
-            req_id = input_batch.req_ids[i]
-            req_state = self.runner.requests.get(req_id)
-            if req_state is None:
-                prompt_ids.append("")
-                anchor_list.append(None)
-                continue
+        t0_pid = _now_ns() if gen_enabled else 0
+        with (hspec_record_function("hspec/proposal/prompt_id")
+              if prof_enabled else nullcontext()):
+            prompt_ids = self._get_prompt_ids_for_batch(req_ids)
+        t1_pid = _now_ns() if gen_enabled else 0
 
-            # Stable prompt_id from ORIGINAL prompt tokens (not token_ids_cpu)
-            t0_pid = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
-            with (hspec_record_function("hspec/proposal/prompt_id")
-                  if prof_enabled else nullcontext()):
-                pid = prompt_id_from_token_ids(req_state.prompt_token_ids)
-            t1_pid = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
-            prompt_ids.append(pid)
+        decoded_lens = [
+            len(getattr(req_state, "output_token_ids", []))
+            if req_state is not None else 0
+            for req_state in req_states
+        ]
 
-            # Anchor hidden state for this request
-            t0_extract = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
-            with (hspec_record_function("hspec/proposal/extract_anchor_hs")
-                  if prof_enabled else nullcontext()):
-                hs = self._extract_anchor_hs(
-                    i, hidden_states, valid_sampled_token_ids,
+        t0_extract = _now_ns() if gen_enabled else 0
+        with (hspec_record_function("hspec/proposal/extract_anchor_hs")
+              if prof_enabled else nullcontext()):
+            anchor_hidden_states, anchor_batch_indices = (
+                self._extract_anchor_hs_batch(
+                    hidden_states,
+                    valid_sampled_token_ids,
                     spec_decode_metadata,
                 )
-            t1_extract = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
-            anchor_list.append(hs)
-            if gen_enabled and i == gen_req_idx:
-                # Stash per-call stage timing for the traced request.
-                # We will include it in the final log after draft retrieval.
-                self._hspec_gen_timing = {
-                    "prompt_id_ms": _ns_to_ms(t1_pid - t0_pid) if t0_pid else 0.0,
-                    "extract_anchor_hs_ms": _ns_to_ms(t1_extract - t0_extract) if t0_extract else 0.0,
-                    "anchor_total_ms": _ns_to_ms(_now_ns() - t0_anchor) if t0_anchor else 0.0,
-                }
+            )
+        t1_extract = _now_ns() if gen_enabled else 0
+
+        anchor_list: List[Optional[torch.Tensor]] = [None] * batch_size
+        for slot, batch_idx in enumerate(anchor_batch_indices):
+            anchor_list[batch_idx] = anchor_hidden_states[slot]
+
+        if gen_enabled:
+            self._hspec_gen_timing = {
+                "prompt_id_ms": _ns_to_ms(t1_pid - t0_pid) if t0_pid else 0.0,
+                "extract_anchor_hs_ms": _ns_to_ms(t1_extract - t0_extract) if t0_extract else 0.0,
+                "anchor_total_ms": _ns_to_ms(t1_extract - t0_pid) if t0_pid else 0.0,
+            }
 
         if HSPEC_DEBUG:
             # (1)(2) One prompt per step: only the chosen request
             # Log correlation fields (req_id, prompt_id, decoded_len, decoded_tokens)
             try:
                 di = min(HSPEC_DEBUG_REQ_IDX, batch_size - 1) if batch_size else 0
-                req_id = input_batch.req_ids[di]
-                req_state = self.runner.requests.get(req_id)
+                req_id = req_ids[di]
+                req_state = req_states[di]
                 if req_state is None:
                     decoded_tokens = []
                     prompt_tokens = []
@@ -752,9 +997,12 @@ class HSpecProposer(Proposer):
         # 3. On-device projection + similarity matching
         results: List[List[int]] = [[] for _ in range(batch_size)]
         # Accumulate on-device tensors to batch the single CPU sync
-        pending: List[tuple] = []   # (batch_idx, sim_tensor, idx_tensor, cached)
+        pending: List[tuple] = []   # (batch_idx, sim_tensor, idx_tensor, cached, base_pos)
         trace_pending_j: Optional[int] = None
         trace_skip_reason: Optional[str] = None
+        active_match_indices: List[int] = []
+        active_cached_tables: List[_CachedPromptTable] = []
+        trace_candidate_selected = False
 
         for i in range(batch_size):
             hs = anchor_list[i]
@@ -779,33 +1027,55 @@ class HSpecProposer(Proposer):
                     )
                 continue
 
-            # All on NPU, no CPU sync
-            # Cast bf16 → fp32 (Ascend NPU doesn't support bf16↔CPU)
-            t0_cast = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
-            prof_this_req = prof_enabled
-            with (hspec_record_function("hspec/proposal/project_and_match", use_npu_stream=True)
-                  if prof_this_req else nullcontext()):
-                hs_f = hs.float()
-                t1_cast = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
-
-                # Project: z = (h − μ) Wᵀ   →  (K,)
-                t0_proj = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
-                z = (hs_f - cached.mean) @ cached.components.T
-                t1_proj = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
-
-                # L2 normalise
-                # z = F.normalize(z, dim=0)
-
-                # Cosine similarity with all stored keys
-                t0_sim = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
-                sims = cached.keys @ z          # (n_entries,)
-                best_sim, best_idx = sims.max(dim=0)
-                t1_sim = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
-
-            pending.append((i, best_sim, best_idx, cached))
+            active_match_indices.append(i)
+            active_cached_tables.append(cached)
             if gen_enabled and i == gen_req_idx:
-                trace_pending_j = len(pending) - 1
-                # Accumulate stage timings for traced request.
+                trace_candidate_selected = True
+
+        if active_match_indices:
+            t0_cast = _now_ns() if gen_enabled else 0
+            with (hspec_record_function("hspec/proposal/project_and_match", use_npu_stream=True)
+                  if prof_enabled else nullcontext()):
+                active_anchor_hs = torch.stack(
+                    [anchor_list[i] for i in active_match_indices]
+                ).float()
+                t1_cast = _now_ns() if gen_enabled else 0
+
+                t0_proj = _now_ns() if gen_enabled else 0
+                mean_batch = torch.stack(
+                    [cached.mean for cached in active_cached_tables]
+                )
+                comp_batch, keys_batch, key_lengths = self._build_batched_table_tensors(
+                    active_cached_tables,
+                    dtype=active_anchor_hs.dtype,
+                    device=active_anchor_hs.device,
+                )
+                z_batch = torch.bmm(
+                    (active_anchor_hs - mean_batch).unsqueeze(1),
+                    comp_batch.transpose(1, 2),
+                ).squeeze(1)
+                t1_proj = _now_ns() if gen_enabled else 0
+
+                t0_sim = _now_ns() if gen_enabled else 0
+                pending.extend(
+                    self._match_projected_batch(
+                        active_match_indices,
+                        active_cached_tables,
+                        z_batch,
+                        keys_batch,
+                        key_lengths,
+                        decoded_lens,
+                    )
+                )
+                t1_sim = _now_ns() if gen_enabled else 0
+
+            if gen_enabled:
+                for j, (batch_idx, _, _, _, _) in enumerate(pending):
+                    if batch_idx == gen_req_idx:
+                        trace_pending_j = j
+                        break
+                if trace_candidate_selected and trace_pending_j is None:
+                    trace_skip_reason = "empty_entry_window"
                 td = getattr(self, "_hspec_gen_timing", {}) if hasattr(self, "_hspec_gen_timing") else {}
                 td.update({
                     "cast_fp32_ms": _ns_to_ms(t1_cast - t0_cast) if t0_cast else 0.0,
@@ -817,8 +1087,8 @@ class HSpecProposer(Proposer):
         if HSPEC_DEBUG:
             try:
                 di = min(HSPEC_DEBUG_REQ_IDX, batch_size - 1) if batch_size else 0
-                req_id = input_batch.req_ids[di]
-                req_state = self.runner.requests.get(req_id)
+                req_id = req_ids[di]
+                req_state = req_states[di]
                 decoded_tokens_at_match = []
                 if req_state is not None:
                     decoded_tokens_at_match = list(getattr(req_state, "output_token_ids", []))
@@ -830,7 +1100,7 @@ class HSpecProposer(Proposer):
                 cached_for_debug = None
                 best_idx_val = -1
                 sim_val = float("nan")
-                for (i, sim_t, idx_t, cached) in pending:
+                for (i, sim_t, idx_t, cached, _) in pending:
                     if i != di:
                         continue
                     cached_for_debug = cached
@@ -906,8 +1176,8 @@ class HSpecProposer(Proposer):
             if gen_enabled and batch_size > 0:
                 di = min(gen_req_idx, batch_size - 1)
                 try:
-                    req_id = input_batch.req_ids[di]
-                    req_state = self.runner.requests.get(req_id)
+                    req_id = req_ids[di]
+                    req_state = req_states[di]
                     decoded_len = len(getattr(req_state, "output_token_ids", [])) if req_state is not None else -1
                     pid = prompt_ids[di] if di < len(prompt_ids) else ""
                     td = getattr(self, "_hspec_gen_timing", {}) if hasattr(self, "_hspec_gen_timing") else {}
@@ -944,13 +1214,13 @@ class HSpecProposer(Proposer):
             t1_copy = _now_ns() if gen_enabled else 0
 
         # 5. Draft token retrieval (CPU-only, O(1) per request)
-        for j, (i, _, _, cached) in enumerate(pending):
+        for j, (i, _, _, cached, base_pos) in enumerate(pending):
             t0_retrieve = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
             if sims_cpu[j] < self.similarity_threshold:
                 continue
 
             # Adaptive window update
-            req_id = input_batch.req_ids[i]
+            req_id = req_ids[i]
             accept_len = self._accept_lengths.get(req_id, 1)
             cached.update_window(accept_len)
 
@@ -966,6 +1236,36 @@ class HSpecProposer(Proposer):
             results[i] = draft
             self._stat_hits += 1
             self._stat_total_draft_len += len(draft)
+
+            if draft:
+                req_id = req_ids[i]
+                matched_entry_idx = int(idxs_cpu[j])
+                matched_rollout_idx = int(cached.entry_rollout_idx[matched_entry_idx])
+                matched_pos = int(cached.entry_offset[matched_entry_idx]) - 1
+                delta = int(matched_pos - int(base_pos))
+                abs_delta = abs(delta)
+                req_state = req_states[i]
+                current_tokens = (
+                    list(getattr(req_state, "output_token_ids", []))
+                    if req_state is not None else []
+                )
+                histo_ngram_match = self._has_same_histo_ngram(
+                    current_tokens,
+                    cached.rollout_seqs[matched_rollout_idx],
+                    matched_pos,
+                )
+                self._entry_pending_match_count += 1
+                self._entry_pending_delta_sum += delta
+                self._entry_pending_abs_delta_sum += abs_delta
+                self._pending_verify_meta[req_id] = {
+                    "delta": delta,
+                    "abs_delta": abs_delta,
+                    "base_pos": int(base_pos),
+                    "matched_pos": matched_pos,
+                    "matched_rollout_idx": matched_rollout_idx,
+                    "histo_ngram_match": int(histo_ngram_match),
+                }
+
             t1_retrieve = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
             if gen_enabled and i == gen_req_idx:
                 td = getattr(self, "_hspec_gen_timing", {}) if hasattr(self, "_hspec_gen_timing") else {}
@@ -987,8 +1287,8 @@ class HSpecProposer(Proposer):
         if gen_enabled and batch_size > 0:
             di = min(gen_req_idx, batch_size - 1)
             try:
-                req_id = input_batch.req_ids[di]
-                req_state = self.runner.requests.get(req_id)
+                req_id = req_ids[di]
+                req_state = req_states[di]
                 decoded_len = len(getattr(req_state, "output_token_ids", [])) if req_state is not None else -1
                 pid = prompt_ids[di] if di < len(prompt_ids) else ""
                 anchor = anchor_list[di] if di < len(anchor_list) else None
@@ -1040,7 +1340,7 @@ class HSpecProposer(Proposer):
                 di = min(HSPEC_DEBUG_REQ_IDX, batch_size - 1) if batch_size else 0
                 # Matched + draft for chosen request only
                 matched_line = None
-                for j, (i, _, _, cached) in enumerate(pending):
+                for j, (i, _, _, cached, _) in enumerate(pending):
                     if i != di or sims_cpu[j] < self.similarity_threshold:
                         continue
                     matched_line = (
@@ -1076,10 +1376,51 @@ class HSpecProposer(Proposer):
             self._accept_lengths[rid] = al
             self._stat_accept_sum += int(al)
             self._stat_accept_count += 1
-    
+
+    def update_verification_outcomes(
+        self,
+        req_ids: List[str],
+        accepted_prefix_lengths: List[int],
+    ) -> int:
+        """Consume true draft-prefix acceptance outcomes for HSpec studies.
+
+        ``accepted_prefix_lengths`` must be the verification-time
+        prefix-match lengths between ``draft`` and ``out`` for each request.
+        """
+        accept_advan_count = 0
+        for rid, accepted_prefix_len in zip(req_ids, accepted_prefix_lengths):
+            meta = self._pending_verify_meta.pop(rid, None)
+            if meta is None:
+                continue
+            abs_delta = int(meta["abs_delta"])
+            apl = int(accepted_prefix_len)
+            self._entry_pending_verify_count += 1
+            self._entry_pending_accept_len_sum += apl
+            self._entry_pending_abs_delta_verify[abs_delta] += 1
+            if apl >= 1:
+                self._entry_pending_accept_count += 1
+                self._entry_pending_abs_delta_accept[abs_delta] += 1
+                self._entry_pending_abs_delta_accept_len_sum[abs_delta] += apl
+                if not bool(meta.get("histo_ngram_match", 0)):
+                    accept_advan_count += 1
+        return accept_advan_count
+
+    def update_entry_verification_outcomes(
+        self,
+        req_ids: List[str],
+        accepted_prefix_lengths: List[int],
+    ) -> None:
+        """Backward-compatible wrapper for entry-only callers."""
+        self.update_verification_outcomes(req_ids, accepted_prefix_lengths)
+
     def clear_request(self, req_id: str):
         """Clear per-request state on completion."""
         self._accept_lengths.pop(req_id, None)
+        self._pending_verify_meta.pop(req_id, None)
+        self._req_prompt_ids.pop(req_id, None)
+        if req_id in self._cached_batch_req_ids:
+            self._cached_batch_req_ids = ()
+            self._cached_batch_prompt_ids = []
 
     # interface stubs
 
