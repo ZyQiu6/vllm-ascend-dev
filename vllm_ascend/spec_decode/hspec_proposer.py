@@ -1381,13 +1381,14 @@ class HSpecProposer(Proposer):
         self,
         req_ids: List[str],
         accepted_prefix_lengths: List[int],
-    ) -> int:
+    ) -> tuple[int, int]:
         """Consume true draft-prefix acceptance outcomes for HSpec studies.
 
         ``accepted_prefix_lengths`` must be the verification-time
         prefix-match lengths between ``draft`` and ``out`` for each request.
         """
         accept_advan_count = 0
+        reject_advan_count = 0
         for rid, accepted_prefix_len in zip(req_ids, accepted_prefix_lengths):
             meta = self._pending_verify_meta.pop(rid, None)
             if meta is None:
@@ -1403,7 +1404,10 @@ class HSpecProposer(Proposer):
                 self._entry_pending_abs_delta_accept_len_sum[abs_delta] += apl
                 if not bool(meta.get("histo_ngram_match", 0)):
                     accept_advan_count += 1
-        return accept_advan_count
+            else:
+                if not bool(meta.get("histo_ngram_match", 0)):
+                    reject_advan_count += 1
+        return (accept_advan_count, reject_advan_count)
 
     def update_entry_verification_outcomes(
         self,

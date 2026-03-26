@@ -246,6 +246,7 @@ class HSpecTableGroup:
         self._accept_count = 0
         self._accept_len_sum = 0
         self._accept_advan_count = 0
+        self._reject_advan_count = 0
         # Entry-position study metrics (reported asynchronously from the
         # worker-local proposer).
         self._entry_match_count = 0
@@ -524,6 +525,7 @@ class HSpecTableGroup:
             "accept_times": self._accept_count,
             "accept_length_sum": self._accept_len_sum,
             "accept_times_advan": self._accept_advan_count,
+            "reject_times_advan": self._reject_advan_count,
             "build_count": self._build_count,
             "discard_count": self._discard_count,
             "num_prompts": len(self._active),
@@ -553,6 +555,7 @@ class HSpecTableGroup:
         self._accept_count = 0
         self._accept_len_sum = 0
         self._accept_advan_count = 0
+        self._reject_advan_count = 0
         self._entry_match_count = 0
         self._entry_delta_sum = 0
         self._entry_abs_delta_sum = 0
@@ -593,6 +596,7 @@ class HSpecTableGroup:
         accept_times: int = 0,
         accept_length_sum: int = 0,
         accept_times_advan: int = 0,
+        reject_times_advan: int = 0,
     ) -> None:
         """Accumulate post-verification stats (after rejection sampling).
 
@@ -604,6 +608,7 @@ class HSpecTableGroup:
             self._accept_count += int(accept_times)
             self._accept_len_sum += int(accept_length_sum)
             self._accept_advan_count += int(accept_times_advan)
+            self._reject_advan_count += int(reject_times_advan)
         except Exception:
             pass
 
@@ -837,6 +842,7 @@ class GlobalHSpecTableGroup:
         accept_times: int,
         accept_length_sum: int,
         accept_times_advan: int = 0,
+        reject_times_advan: int = 0,
     ) -> Optional[ray.ObjectRef]:
         """Fire-and-forget reporting of verification stats from vLLM workers."""
         if not self.groups:
@@ -848,6 +854,7 @@ class GlobalHSpecTableGroup:
                 accept_times=accept_times,
                 accept_length_sum=accept_length_sum,
                 accept_times_advan=accept_times_advan,
+                reject_times_advan=reject_times_advan,
             )
         except Exception:
             return None
@@ -1146,6 +1153,8 @@ class GlobalHSpecTableGroup:
                 "hspec/total_entries": 0,
                 "hspec/accept_times_advan": 0,
                 "hspec/accept_times_advan_ratio": 0.0,
+                "hspec/reject_times_advan": 0,
+                "hspec/reject_times_advan_ratio": 0.0,
                 "hspec/entry_match_avg_signed_delta": 0.0,
                 "hspec/entry_match_avg_abs_delta": 0.0,
                 "hspec/entry_verify_times": 0,
@@ -1169,6 +1178,8 @@ class GlobalHSpecTableGroup:
         at = agg.get("accept_times", 0)
         als = agg.get("accept_length_sum", 0)
         ata = agg.get("accept_times_advan", 0)
+        rta = agg.get("reject_times_advan", 0)
+        rt = max(vt - at, 0)
         entry_match_count = agg.get("entry_match_count", 0)
         entry_delta_sum = agg.get("entry_delta_sum", 0)
         entry_abs_delta_sum = agg.get("entry_abs_delta_sum", 0)
@@ -1198,6 +1209,10 @@ class GlobalHSpecTableGroup:
             "hspec/accept_times_advan": ata,
             "hspec/accept_times_advan_ratio": (
                 ata / at if at > 0 else 0.0
+            ),
+            "hspec/reject_times_advan": rta,
+            "hspec/reject_times_advan_ratio": (
+                rta / rt if rt > 0 else 0.0
             ),
             # Entry-position study summaries.
             "hspec/entry_match_avg_signed_delta": (

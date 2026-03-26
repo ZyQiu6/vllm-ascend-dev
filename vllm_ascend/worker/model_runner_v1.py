@@ -435,6 +435,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self._hspec_verify_pending_accept = 0
         self._hspec_verify_pending_accept_len_sum = 0
         self._hspec_verify_pending_accept_advan = 0
+        self._hspec_verify_pending_reject_advan = 0
 
         # kv role
         self.is_kv_producer = False
@@ -625,12 +626,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         accept_times: int,
         accept_length_sum: int,
         accept_times_advan: int = 0,
+        reject_times_advan: int = 0,
     ) -> None:
         """Best-effort, low-frequency metrics reporting (never block hot loop)."""
         if not self._hspec_verify_metrics_enabled:
             return
         if (verify_times <= 0 and accept_times <= 0
-                and accept_length_sum <= 0 and accept_times_advan <= 0):
+                and accept_length_sum <= 0 and accept_times_advan <= 0
+                and reject_times_advan <= 0):
             return
         # Only meaningful for HSPEC.
         if not self._hspec_collect:
@@ -642,7 +645,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self._hspec_verify_pending_accept_len_sum += int(accept_length_sum)
         if not hasattr(self, "_hspec_verify_pending_accept_advan"):
             self._hspec_verify_pending_accept_advan = 0
+        if not hasattr(self, "_hspec_verify_pending_reject_advan"):
+            self._hspec_verify_pending_reject_advan = 0
         self._hspec_verify_pending_accept_advan += int(accept_times_advan)
+        self._hspec_verify_pending_reject_advan += int(reject_times_advan)
 
         if self._hspec_verify_report_every_calls <= 1:
             should_flush = True
@@ -658,7 +664,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         at = int(self._hspec_verify_pending_accept)
         als = int(self._hspec_verify_pending_accept_len_sum)
         ata = int(getattr(self, "_hspec_verify_pending_accept_advan", 0))
-        if vt <= 0 and at <= 0 and als <= 0 and ata <= 0:
+        rta = int(getattr(self, "_hspec_verify_pending_reject_advan", 0))
+        if vt <= 0 and at <= 0 and als <= 0 and ata <= 0 and rta <= 0:
             return
 
         # Report to the same global table group used by the HSPEC proposer.
@@ -666,11 +673,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if tables is None or not hasattr(tables, "report_verification_metrics_async"):
             return
         try:
-            tables.report_verification_metrics_async(vt, at, als, ata)
+            tables.report_verification_metrics_async(vt, at, als, ata, rta)
             self._hspec_verify_pending_verify = 0
             self._hspec_verify_pending_accept = 0
             self._hspec_verify_pending_accept_len_sum = 0
             self._hspec_verify_pending_accept_advan = 0
+            self._hspec_verify_pending_reject_advan = 0
         except Exception:
             # Swallow all errors; metrics must never affect decoding.
             pass
@@ -2670,6 +2678,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 # We compute on CPU lists (valid_sampled_token_ids) to avoid
                 # introducing extra device sync.
                 accept_advan_add = 0
+                reject_advan_add = 0
                 if (not self.use_async_scheduling
                         and self.drafter is not None
                         and getattr(self.drafter, "name", None) == SpecDcodeType.HSPEC
@@ -2678,12 +2687,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         and max_gen_len > 1):
                     try:
                         n = min(len(self.input_batch.req_ids), len(accepted_prefix_lengths))
-                        accept_advan_add = int(self.drafter.update_verification_outcomes(
+                        accept_advan_add, reject_advan_add = self.drafter.update_verification_outcomes(
                             self.input_batch.req_ids[:n],
                             accepted_prefix_lengths[:n],
-                        ))
+                        )
+                        accept_advan_add = int(accept_advan_add)
+                        reject_advan_add = int(reject_advan_add)
                     except Exception:
                         accept_advan_add = 0
+                        reject_advan_add = 0
 
                 if (self._hspec_collect and self._hspec_verify_metrics_enabled
                         and spec_decode_metadata is not None
@@ -2706,7 +2718,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                 accept_len_add += int(accepted)
                         self._hspec_maybe_report_verification_metrics(
                             verify_add, accept_add, accept_len_add,
-                            accept_advan_add)
+                            accept_advan_add, reject_advan_add)
                     except Exception:
                         pass
                 # Mask out the sampled tokens that should not be sampled.
