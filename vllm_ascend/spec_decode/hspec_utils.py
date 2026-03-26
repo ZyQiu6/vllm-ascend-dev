@@ -26,6 +26,7 @@ import struct
 import threading
 import torch
 import numpy as np
+from typing import Tuple
 
 try:
     from torch.profiler import record_function as _record_function
@@ -560,11 +561,15 @@ def compute_pca(
     hidden_states: np.ndarray,
     n_components: int = 64,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute PCA parameters from anchor hidden states via economy SVD.
+    """Compute PCA parameters from anchor hidden states via economy SVD,
+    and return exactly `n_components` principal components (padded with zeros
+    if necessary).
 
     Given N token-level anchor hidden states of dimension D, compute the
-    centroid μ and the top-K principal component directions W.
-
+    centroid μ and the top-K principal component directions W, where K is
+    min(n_components, N, D). If K < n_components, the remaining components
+    are set to zero vectors.
+    
     Internally:
         1. μ = mean(H, axis=0)
         2. H_c = H − μ                         (centering)
@@ -572,13 +577,14 @@ def compute_pca(
         4. W = V^T[:K]                          (top-K rows)
 
     Args:
-        hidden_states: (N, D) float array.  N = total token positions,
+        hidden_states: (N, D) float array. N = total token positions,
                        D = model hidden dimension.
-        n_components:  Desired number of principal components K.
+        n_components:  Desired number of principal components.
 
     Returns:
         mean:       (D,)        float32.
-        components: (K_act, D)  float32,  K_act = min(K, N, D).
+        components: (n_components, D)  float32. If the data rank is less than
+                    n_components, the extra rows are zero vectors.
 
     Raises:
         ValueError: If input is not 2-D or has zero rows.
@@ -591,8 +597,6 @@ def compute_pca(
     if N == 0:
         raise ValueError("Cannot compute PCA on zero samples")
 
-    K = min(n_components, N, D)
-
     # Upcast to float32 for numerical stability (no-copy if already f32).
     hs = hidden_states.astype(np.float32, copy=False)
 
@@ -603,12 +607,24 @@ def compute_pca(
     centered = hs - mean         # (N, D)
 
     # 3. Economy SVD: centered = U · diag(S) · V^T
-    #    Rows of V^T are principal component directions, sorted by
-    #    explained variance (descending singular values).
+    #    Vt has shape (min(N, D), D)
     _, _, Vt = np.linalg.svd(centered, full_matrices=False)
 
-    # 4. Take top-K components
-    components = np.ascontiguousarray(Vt[:K], dtype=np.float32)  # (K, D)
+    # 4. Determine how many components we can actually take.
+    #    Vt always has min(N, D) rows.
+    max_components = min(N, D)
+    effective_components = min(n_components, max_components)
+
+    # 5. Take the top effective_components components.
+    components = Vt[:effective_components].astype(np.float32)  # (effective_components, D)
+
+    # 6. Pad with zero rows if we have fewer than n_components.
+    if components.shape[0] < n_components:
+        padding = np.zeros((n_components - components.shape[0], D), dtype=np.float32)
+        components = np.vstack([components, padding])          # (n_components, D)
+
+    # Ensure contiguous layout for later use (optional, but good practice).
+    components = np.ascontiguousarray(components)
 
     return mean.astype(np.float32), components
 

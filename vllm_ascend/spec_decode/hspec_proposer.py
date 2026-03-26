@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional, Set
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -730,19 +731,24 @@ class HSpecProposer(Proposer):
         batch_indices: List[int],
         cached_tables: List[_CachedPromptTable],
         z_batch: torch.Tensor,
-        keys_batch: torch.Tensor,
-        key_lengths: torch.Tensor,
         decoded_lens: List[int],
     ) -> List[tuple[int, torch.Tensor, torch.Tensor, _CachedPromptTable, int]]:
         """Fully batched similarity matching with padding + mask over ragged M."""
         if not batch_indices:
             return []
+        key_tensors = [cached.keys[:cached.n_entries] for cached in cached_tables]
+        lengths = torch.tensor(
+            [int(cached.n_entries) for cached in cached_tables],
+            dtype=torch.long,
+            device=z_batch.device,
+        )
+        keys_batch = pad_sequence(key_tensors, batch_first=True)
         sims = torch.bmm(keys_batch, z_batch.unsqueeze(-1)).squeeze(-1)
         if keys_batch.shape[1] > 0:
             positions = torch.arange(
                 keys_batch.shape[1], device=z_batch.device,
             ).unsqueeze(0)
-            invalid_mask = positions >= key_lengths.unsqueeze(1)
+            invalid_mask = positions >= lengths.unsqueeze(1)
             sims = sims.masked_fill(invalid_mask, torch.finfo(sims.dtype).min)
         best_sims, best_idxs = sims.max(dim=1)
         return [
@@ -1034,7 +1040,7 @@ class HSpecProposer(Proposer):
 
         if active_match_indices:
             t0_cast = _now_ns() if gen_enabled else 0
-            with (hspec_record_function("hspec/proposal/project_and_match", use_npu_stream=True)
+            with (hspec_record_function("hspec/proposal/hs_to_tensor", use_npu_stream=True)
                   if prof_enabled else nullcontext()):
                 active_anchor_hs = torch.stack(
                     [anchor_list[i] for i in active_match_indices]
@@ -1042,14 +1048,20 @@ class HSpecProposer(Proposer):
                 t1_cast = _now_ns() if gen_enabled else 0
 
                 t0_proj = _now_ns() if gen_enabled else 0
+                
+            with (hspec_record_function("hspec/proposal/mean_to_tensor", use_npu_stream=True)
+                  if prof_enabled else nullcontext()):
                 mean_batch = torch.stack(
                     [cached.mean for cached in active_cached_tables]
                 )
-                comp_batch, keys_batch, key_lengths = self._build_batched_table_tensors(
-                    active_cached_tables,
-                    dtype=active_anchor_hs.dtype,
-                    device=active_anchor_hs.device,
+            
+            with (hspec_record_function("hspec/proposal/build_batched_table_tensors", use_npu_stream=True)
+                  if prof_enabled else nullcontext()):
+                comp_batch = torch.stack(
+                    [cached.components for cached in active_cached_tables]
                 )
+            with (hspec_record_function("hspec/proposal/project", use_npu_stream=True)
+                  if prof_enabled else nullcontext()):
                 z_batch = torch.bmm(
                     (active_anchor_hs - mean_batch).unsqueeze(1),
                     comp_batch.transpose(1, 2),
@@ -1057,13 +1069,14 @@ class HSpecProposer(Proposer):
                 t1_proj = _now_ns() if gen_enabled else 0
 
                 t0_sim = _now_ns() if gen_enabled else 0
+                
+            with (hspec_record_function("hspec/proposal/match", use_npu_stream=True)
+                  if prof_enabled else nullcontext()):
                 pending.extend(
                     self._match_projected_batch(
                         active_match_indices,
                         active_cached_tables,
                         z_batch,
-                        keys_batch,
-                        key_lengths,
                         decoded_lens,
                     )
                 )
