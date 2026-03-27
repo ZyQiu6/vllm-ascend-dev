@@ -26,7 +26,6 @@ from typing import Any, Dict, List, Optional, Set
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.nn.utils.rnn import pad_sequence
 
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -86,6 +85,7 @@ class _CachedPromptTable:
     __slots__ = (
         "mean", "components", "keys",
         "rollout_seqs", "entry_rollout_idx", "entry_offset",
+        "draft_prefix_tokens", "draft_prefix_lens",
         "rollout_entry_starts", "rollout_entry_lens",
         "n_entries",
         "wnd_size", "max_wnd", "min_wnd",
@@ -99,6 +99,8 @@ class _CachedPromptTable:
         rollout_seqs: list,
         entry_rollout_idx: np.ndarray,
         entry_offset: np.ndarray,
+        draft_prefix_tokens: np.ndarray,
+        draft_prefix_lens: np.ndarray,
         rollout_entry_starts: np.ndarray,
         rollout_entry_lens: np.ndarray,
         n_entries: int,
@@ -112,6 +114,8 @@ class _CachedPromptTable:
         self.rollout_seqs = rollout_seqs              # list[np.ndarray int32], CPU
         self.entry_rollout_idx = entry_rollout_idx    # (M,) int32, CPU
         self.entry_offset = entry_offset              # (M,) int32, CPU
+        self.draft_prefix_tokens = draft_prefix_tokens  # (M, W) int32, CPU
+        self.draft_prefix_lens = draft_prefix_lens      # (M,) int32, CPU
         self.rollout_entry_starts = rollout_entry_starts  # (R,) int32, CPU
         self.rollout_entry_lens = rollout_entry_lens      # (R,) int32, CPU
         self.n_entries = n_entries
@@ -123,10 +127,13 @@ class _CachedPromptTable:
         """O(1) slice into the rollout token buffer."""
         if entry_idx < 0 or entry_idx >= self.n_entries:
             return []
-        ridx = int(self.entry_rollout_idx[entry_idx])
-        off = int(self.entry_offset[entry_idx])
-        seq = self.rollout_seqs[ridx]
-        return seq[off: off + max_tokens].tolist()
+        take = min(
+            int(max_tokens),
+            int(self.draft_prefix_lens[entry_idx]),
+        )
+        if take <= 0:
+            return []
+        return self.draft_prefix_tokens[entry_idx, :take].tolist()
 
     def update_window(self, accept_length: int):
         """Congestion-control style adaptive window"""
@@ -134,6 +141,47 @@ class _CachedPromptTable:
             self.wnd_size = min(self.wnd_size + 1, self.max_wnd)
         elif accept_length <= 1:
             self.wnd_size = max(self.wnd_size // 2, self.min_wnd)
+
+
+class _BatchedPromptTableCache:
+    """Worker-local batch-aligned padded tensors for fast batched matching."""
+
+    __slots__ = (
+        "req_ids",
+        "cache_generation",
+        "batch_indices",
+        "batch_idx_to_row",
+        "cached_tables",
+        "mean_batch",
+        "components_t_batch",
+        "keys_batch",
+        "key_lengths",
+        "invalid_key_mask",
+    )
+
+    def __init__(
+        self,
+        req_ids: tuple[str, ...],
+        cache_generation: int,
+        batch_indices: List[int],
+        batch_idx_to_row: Dict[int, int],
+        cached_tables: List["_CachedPromptTable"],
+        mean_batch: torch.Tensor,
+        components_t_batch: torch.Tensor,
+        keys_batch: torch.Tensor,
+        key_lengths: torch.Tensor,
+        invalid_key_mask: torch.Tensor,
+    ):
+        self.req_ids = req_ids
+        self.cache_generation = cache_generation
+        self.batch_indices = batch_indices
+        self.batch_idx_to_row = batch_idx_to_row
+        self.cached_tables = cached_tables
+        self.mean_batch = mean_batch
+        self.components_t_batch = components_t_batch
+        self.keys_batch = keys_batch
+        self.key_lengths = key_lengths
+        self.invalid_key_mask = invalid_key_mask
 
 
 # Helper function for detokenization (with internal debug when HSPEC_DEBUG=1)
@@ -290,6 +338,7 @@ class HSpecProposer(Proposer):
         self._not_in_table: Set[str] = set()   # prompts known absent
         self._cache_version: int = -1
         self._max_cache_size: int = 512
+        self._cache_generation: int = 0
 
         # Async prefetch state (never blocking in hot loop)
         # Each entry: (ray.ObjectRef, [prompt_ids]) where the future
@@ -309,6 +358,7 @@ class HSpecProposer(Proposer):
         # alignment with just a req-id tuple comparison.
         self._cached_batch_req_ids: tuple[str, ...] = ()
         self._cached_batch_prompt_ids: List[str] = []
+        self._batched_table_cache: Optional[_BatchedPromptTableCache] = None
         # Lightweight local metrics (for functional + perf validation).
         # These live in the vLLM worker process; we never RPC in the hot loop.
         self._stat_calls = 0
@@ -384,6 +434,7 @@ class HSpecProposer(Proposer):
             return
 
         import ray as _ray
+        cache_mutated = False
 
         all_futures = [f for f, _ in self._pending_fetches]
         ready_refs, _ = _ray.wait(
@@ -415,6 +466,7 @@ class HSpecProposer(Proposer):
                         self._not_in_table.clear()
                         self._cache_version = version
                         version_bumped = True
+                        cache_mutated = True
 
                     # Populate cache with fresh data
                     for pid in pids:
@@ -424,14 +476,18 @@ class HSpecProposer(Proposer):
                                 cached = self._build_cached_table(data)
                                 self._cache[pid] = cached
                                 self._cache.move_to_end(pid)
+                                cache_mutated = True
                             except Exception:
                                 self._not_in_table.add(pid)
+                                cache_mutated = True
                         else:
                             self._not_in_table.add(pid)
+                            cache_mutated = True
             except Exception:
                 # On error mark prompts as absent to avoid infinite retry
                 for pid in pids:
                     self._not_in_table.add(pid)
+                cache_mutated = True
 
             # Remove consumed pids from pending set
             for pid in pids:
@@ -449,6 +505,11 @@ class HSpecProposer(Proposer):
         # LRU eviction
         while len(self._cache) > self._max_cache_size:
             self._cache.popitem(last=False)
+            cache_mutated = True
+
+        if cache_mutated:
+            self._cache_generation += 1
+            self._batched_table_cache = None
 
     def _fire_prefetch_async(self, prompt_ids: List[str]) -> None:
         """Fire async Ray futures for uncached prompts – **non-blocking**.
@@ -503,6 +564,55 @@ class HSpecProposer(Proposer):
         self._cached_batch_req_ids = batch_req_ids
         self._cached_batch_prompt_ids = prompt_ids
         return prompt_ids
+
+    def _get_or_build_batched_table_cache(
+        self,
+        req_ids: List[str],
+        prompt_ids: List[str],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Optional[_BatchedPromptTableCache]:
+        req_ids_tuple = tuple(str(req_id) for req_id in req_ids)
+        cached = self._batched_table_cache
+        if (
+            cached is not None
+            and cached.req_ids == req_ids_tuple
+            and cached.cache_generation == self._cache_generation
+        ):
+            return cached
+
+        batch_indices: List[int] = []
+        cached_tables: List[_CachedPromptTable] = []
+        for i, pid in enumerate(prompt_ids):
+            prompt_table = self._cache.get(pid)
+            if prompt_table is None or prompt_table.n_entries <= 0:
+                continue
+            batch_indices.append(i)
+            cached_tables.append(prompt_table)
+
+        if not batch_indices:
+            self._batched_table_cache = None
+            return None
+
+        mean_batch, components_t_batch, keys_batch, key_lengths, invalid_key_mask = \
+            self._build_batched_table_tensors(cached_tables, dtype, device)
+        batch_idx_to_row = {
+            batch_idx: row for row, batch_idx in enumerate(batch_indices)
+        }
+        cached = _BatchedPromptTableCache(
+            req_ids=req_ids_tuple,
+            cache_generation=self._cache_generation,
+            batch_indices=batch_indices,
+            batch_idx_to_row=batch_idx_to_row,
+            cached_tables=cached_tables,
+            mean_batch=mean_batch,
+            components_t_batch=components_t_batch,
+            keys_batch=keys_batch,
+            key_lengths=key_lengths,
+            invalid_key_mask=invalid_key_mask,
+        )
+        self._batched_table_cache = cached
+        return cached
 
     def _maybe_log_metrics(self) -> None:
         """Best-effort periodic metrics log (no blocking, minimal overhead)."""
@@ -662,6 +772,18 @@ class HSpecProposer(Proposer):
             n_entries,
             len(rollout_seqs),
         )
+        max_wnd = int(data.get("max_wnd", 28))
+        draft_prefix_tokens = np.zeros((n_entries, max_wnd), dtype=np.int32)
+        draft_prefix_lens = np.zeros((n_entries,), dtype=np.int32)
+        entry_offset = np.asarray(data["entry_offset"], dtype=np.int32)
+        for entry_idx in range(n_entries):
+            ridx = int(entry_rollout_idx[entry_idx])
+            off = int(entry_offset[entry_idx])
+            seq = rollout_seqs[ridx]
+            take = min(max_wnd, max(0, len(seq) - off))
+            if take > 0:
+                draft_prefix_tokens[entry_idx, :take] = seq[off: off + take]
+            draft_prefix_lens[entry_idx] = take
 
         return _CachedPromptTable(
             mean=mean,
@@ -669,12 +791,14 @@ class HSpecProposer(Proposer):
             keys=keys,
             rollout_seqs=rollout_seqs,
             entry_rollout_idx=entry_rollout_idx,
-            entry_offset=np.asarray(data["entry_offset"], dtype=np.int32),
+            entry_offset=entry_offset,
+            draft_prefix_tokens=draft_prefix_tokens,
+            draft_prefix_lens=draft_prefix_lens,
             rollout_entry_starts=rollout_entry_starts,
             rollout_entry_lens=rollout_entry_lens,
             n_entries=n_entries,
             wnd_size=int(data.get("wnd_size", 8)),
-            max_wnd=int(data.get("max_wnd", 28)),
+            max_wnd=max_wnd,
             min_wnd=int(data.get("min_wnd", 2)),
         )
 
@@ -689,19 +813,32 @@ class HSpecProposer(Proposer):
         cached_tables: List[_CachedPromptTable],
         dtype: torch.dtype,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Pack ragged per-prompt components/keys into padded batch tensors."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pack ragged per-prompt tables into padded batch tensors.
+
+        Returns:
+            mean_batch:         (B, D)
+            components_t_batch: (B, D, K_max)  pre-transposed for projection
+            keys_batch:         (B, M_max, K_max)
+            key_lengths:        (B,)
+            invalid_key_mask:   (B, M_max)
+        """
         num_rows = len(cached_tables)
         if num_rows == 0:
             empty = torch.empty((0,), dtype=dtype, device=device)
-            return empty, empty, torch.empty((0,), dtype=torch.long, device=device)
+            empty_long = torch.empty((0,), dtype=torch.long, device=device)
+            empty_bool = torch.empty((0,), dtype=torch.bool, device=device)
+            return empty, empty, empty, empty_long, empty_bool
 
         k_max = max(int(cached.components.shape[0]) for cached in cached_tables)
         m_max = max(int(cached.n_entries) for cached in cached_tables)
         hidden_dim = int(cached_tables[0].mean.shape[0])
+        mean_batch = torch.stack(
+            [cached.mean.to(dtype=dtype) for cached in cached_tables]
+        )
 
-        comp_batch = torch.zeros(
-            (num_rows, k_max, hidden_dim),
+        components_t_batch = torch.zeros(
+            (num_rows, hidden_dim, k_max),
             dtype=dtype,
             device=device,
         )
@@ -719,48 +856,27 @@ class HSpecProposer(Proposer):
         for row, cached in enumerate(cached_tables):
             k_i = int(cached.components.shape[0])
             m_i = int(cached.n_entries)
-            comp_batch[row, :k_i, :] = cached.components.to(dtype=dtype)
+            components_t_batch[row, :, :k_i] = cached.components[:k_i].transpose(0, 1).to(dtype=dtype)
             if m_i > 0:
                 keys_batch[row, :m_i, :k_i] = cached.keys[:m_i, :k_i].to(dtype=dtype)
             key_lengths[row] = m_i
 
-        return comp_batch, keys_batch, key_lengths
+        positions = torch.arange(m_max, device=device).unsqueeze(0)
+        invalid_key_mask = positions >= key_lengths.unsqueeze(1)
+
+        return mean_batch, components_t_batch, keys_batch, key_lengths, invalid_key_mask
 
     def _match_projected_batch(
         self,
-        batch_indices: List[int],
-        cached_tables: List[_CachedPromptTable],
         z_batch: torch.Tensor,
-        decoded_lens: List[int],
-    ) -> List[tuple[int, torch.Tensor, torch.Tensor, _CachedPromptTable, int]]:
-        """Fully batched similarity matching with padding + mask over ragged M."""
-        if not batch_indices:
-            return []
-        key_tensors = [cached.keys[:cached.n_entries] for cached in cached_tables]
-        lengths = torch.tensor(
-            [int(cached.n_entries) for cached in cached_tables],
-            dtype=torch.long,
-            device=z_batch.device,
-        )
-        keys_batch = pad_sequence(key_tensors, batch_first=True)
+        keys_batch: torch.Tensor,
+        invalid_key_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fully batched similarity matching with precomputed key padding mask."""
         sims = torch.bmm(keys_batch, z_batch.unsqueeze(-1)).squeeze(-1)
-        if keys_batch.shape[1] > 0:
-            positions = torch.arange(
-                keys_batch.shape[1], device=z_batch.device,
-            ).unsqueeze(0)
-            invalid_mask = positions >= lengths.unsqueeze(1)
-            sims = sims.masked_fill(invalid_mask, torch.finfo(sims.dtype).min)
-        best_sims, best_idxs = sims.max(dim=1)
-        return [
-            (
-                batch_idx,
-                best_sims[row],
-                best_idxs[row],
-                cached,
-                self._window_base_pos(decoded_lens[batch_idx]),
-            )
-            for row, (batch_idx, cached) in enumerate(zip(batch_indices, cached_tables))
-        ]
+        if invalid_key_mask.numel() > 0:
+            sims = sims.masked_fill(invalid_key_mask, torch.finfo(sims.dtype).min)
+        return sims.max(dim=1)
 
     @staticmethod
     def _has_same_histo_ngram(
@@ -786,73 +902,48 @@ class HSpecProposer(Proposer):
     # anchor hidden-state extraction
 
     @staticmethod
-    def _extract_anchor_hs_batch(
+    def _compute_anchor_indices(
         sample_hidden_states: torch.Tensor,
         valid_sampled_token_ids: List[List[int]],
         spec_decode_metadata: Optional[SpecDecodeMetadata],
-    ) -> tuple[torch.Tensor, List[int]]:
-        """Batch-extract all valid anchor hidden states in one gather."""
+    ) -> List[int]:
+        """Compute per-request anchor indices on CPU.
+
+        Small control-flow-heavy logic is cheaper on CPU than as many tiny NPU
+        tensor ops. The caller can then gather all needed rows once with
+        `index_select` on device.
+        """
         batch_size = len(valid_sampled_token_ids)
         if batch_size == 0:
-            return sample_hidden_states[:0], []
+            return []
 
-        device = sample_hidden_states.device
-        accept_lens = torch.tensor(
-            [len(sampled_ids) for sampled_ids in valid_sampled_token_ids],
-            dtype=torch.long,
-            device=device,
-        )
-        anchor_indices = torch.full_like(accept_lens, -1)
+        max_hidden_rows = int(sample_hidden_states.shape[0])
+        accept_lens = [len(sampled_ids) for sampled_ids in valid_sampled_token_ids]
+        anchor_indices = [-1] * batch_size
 
         if spec_decode_metadata is None:
-            candidate_indices = torch.arange(
-                batch_size, dtype=torch.long, device=device,
-            )
-            valid_mask = (
-                (accept_lens > 0)
-                & (candidate_indices < sample_hidden_states.shape[0])
-            )
-            anchor_indices[valid_mask] = candidate_indices[valid_mask]
-        else:
-            num_drafts = torch.as_tensor(
-                spec_decode_metadata.num_draft_tokens[:batch_size],
-                dtype=torch.long,
-                device=device,
-            )
-            bonus_indices = spec_decode_metadata.bonus_logits_indices[
-                :batch_size
-            ].to(device=device, dtype=torch.long)
+            for i, accept_len in enumerate(accept_lens):
+                if accept_len > 0 and i < max_hidden_rows:
+                    anchor_indices[i] = i
+            return anchor_indices
 
-            has_accept = accept_lens > 0
-            no_draft = num_drafts == 0
-            has_draft = num_drafts > 0
-            full_accept = has_draft & (accept_lens >= (num_drafts + 1))
-            partial_accept = has_draft & has_accept & (~full_accept)
-
-            anchor_indices[has_accept & no_draft] = bonus_indices[
-                has_accept & no_draft
-            ]
-            anchor_indices[full_accept] = bonus_indices[full_accept]
-            anchor_indices[partial_accept] = (
-                bonus_indices[partial_accept]
-                - num_drafts[partial_accept]
-                + accept_lens[partial_accept]
-                - 1
-            )
-
-            valid_mask = (
-                (anchor_indices >= 0)
-                & (anchor_indices < sample_hidden_states.shape[0])
-            )
-
-        if not torch.any(valid_mask):
-            return sample_hidden_states[:0], []
-
-        gathered = sample_hidden_states.index_select(0, anchor_indices[valid_mask])
-        valid_batch_indices = torch.nonzero(
-            valid_mask, as_tuple=False,
-        ).flatten().tolist()
-        return gathered, valid_batch_indices
+        num_drafts = spec_decode_metadata.num_draft_tokens[:batch_size]
+        bonus_indices = spec_decode_metadata.bonus_logits_indices[:batch_size].tolist()
+        for i, accept_len in enumerate(accept_lens):
+            if accept_len <= 0:
+                continue
+            bonus_idx = int(bonus_indices[i])
+            n_draft = int(num_drafts[i])
+            anchor_idx = -1
+            if n_draft == 0:
+                anchor_idx = bonus_idx
+            elif accept_len >= n_draft + 1:
+                anchor_idx = bonus_idx
+            else:
+                anchor_idx = bonus_idx - n_draft + accept_len - 1
+            if 0 <= anchor_idx < max_hidden_rows:
+                anchor_indices[i] = anchor_idx
+        return anchor_indices
 
     # main interface
     
@@ -918,18 +1009,19 @@ class HSpecProposer(Proposer):
         t0_extract = _now_ns() if gen_enabled else 0
         with (hspec_record_function("hspec/proposal/extract_anchor_hs")
               if prof_enabled else nullcontext()):
-            anchor_hidden_states, anchor_batch_indices = (
-                self._extract_anchor_hs_batch(
-                    hidden_states,
-                    valid_sampled_token_ids,
-                    spec_decode_metadata,
-                )
+            anchor_indices = self._compute_anchor_indices(
+                hidden_states,
+                valid_sampled_token_ids,
+                spec_decode_metadata,
             )
         t1_extract = _now_ns() if gen_enabled else 0
-
-        anchor_list: List[Optional[torch.Tensor]] = [None] * batch_size
-        for slot, batch_idx in enumerate(anchor_batch_indices):
-            anchor_list[batch_idx] = anchor_hidden_states[slot]
+        trace_anchor = None
+        if batch_size > 0:
+            di = min(gen_req_idx if gen_enabled else HSPEC_DEBUG_REQ_IDX,
+                     batch_size - 1)
+            anchor_idx = anchor_indices[di] if di < len(anchor_indices) else -1
+            if 0 <= anchor_idx < hidden_states.shape[0]:
+                trace_anchor = hidden_states[anchor_idx]
 
         if gen_enabled:
             self._hspec_gen_timing = {
@@ -955,8 +1047,8 @@ class HSpecProposer(Proposer):
                 # Correlation id: same (req_id, prompt_id, decoded_len) in STEP_BEGIN and CACHE_MATCH
                 corr_id = f"req_id={req_id!r} prompt_id={prompt_ids[di]!r} decoded_len={decoded_len}"
                 anchor_hs_summary = "anchor_hs=None"
-                if di < len(anchor_list) and anchor_list[di] is not None:
-                    hs = anchor_list[di]
+                if trace_anchor is not None:
+                    hs = trace_anchor
                     try:
                         norm = float(hs.float().norm().item())
                     except Exception:
@@ -1006,89 +1098,112 @@ class HSpecProposer(Proposer):
         pending: List[tuple] = []   # (batch_idx, sim_tensor, idx_tensor, cached, base_pos)
         trace_pending_j: Optional[int] = None
         trace_skip_reason: Optional[str] = None
-        active_match_indices: List[int] = []
+        active_batch_indices: List[int] = []
+        active_table_rows: List[int] = []
         active_cached_tables: List[_CachedPromptTable] = []
+        active_base_positions: List[int] = []
         trace_candidate_selected = False
+        batch_table_cache = self._get_or_build_batched_table_cache(
+            req_ids,
+            prompt_ids,
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        if batch_table_cache is None and gen_enabled and batch_size > 0:
+            trace_skip_reason = "prompt_not_cached"
 
-        for i in range(batch_size):
-            hs = anchor_list[i]
-            pid = prompt_ids[i]
-            if hs is None:
+        if batch_table_cache is not None:
+            for i in range(batch_size):
+                anchor_idx = anchor_indices[i] if i < len(anchor_indices) else -1
+                if anchor_idx < 0:
+                    if gen_enabled and i == gen_req_idx:
+                        trace_skip_reason = "anchor_none"
+                    continue
+                row = batch_table_cache.batch_idx_to_row.get(i)
+                if row is None:
+                    if gen_enabled and i == gen_req_idx:
+                        trace_skip_reason = "prompt_not_cached"
+                    continue
+                if len(valid_sampled_token_ids[i]) < self.min_match_len:
+                    if gen_enabled and i == gen_req_idx:
+                        trace_skip_reason = (
+                            f"below_min_match_len:{len(valid_sampled_token_ids[i])}"
+                        )
+                    continue
+                active_batch_indices.append(i)
+                active_table_rows.append(row)
                 if gen_enabled and i == gen_req_idx:
-                    trace_skip_reason = "anchor_none"
-                continue
-            if pid not in self._cache:
-                if gen_enabled and i == gen_req_idx:
-                    trace_skip_reason = "prompt_not_cached"
-                continue
-            cached = self._cache[pid]
-            if cached.n_entries == 0:
-                if gen_enabled and i == gen_req_idx:
-                    trace_skip_reason = "empty_prompt_table"
-                continue
-            if len(valid_sampled_token_ids[i]) < self.min_match_len:
-                if gen_enabled and i == gen_req_idx:
-                    trace_skip_reason = (
-                        f"below_min_match_len:{len(valid_sampled_token_ids[i])}"
-                    )
-                continue
+                    trace_candidate_selected = True
 
-            active_match_indices.append(i)
-            active_cached_tables.append(cached)
-            if gen_enabled and i == gen_req_idx:
-                trace_candidate_selected = True
+        if batch_table_cache is not None and active_table_rows:
+            active_cached_tables = [
+                batch_table_cache.cached_tables[row]
+                for row in active_table_rows
+            ]
+            active_base_positions = [
+                self._window_base_pos(decoded_lens[batch_idx])
+                for batch_idx in active_batch_indices
+            ]
 
-        if active_match_indices:
+        if active_batch_indices and batch_table_cache is not None:
             t0_cast = _now_ns() if gen_enabled else 0
-            with (hspec_record_function("hspec/proposal/hs_to_tensor", use_npu_stream=True)
+            with (hspec_record_function("hspec/proposal/anchor_gather", use_npu_stream=True)
                   if prof_enabled else nullcontext()):
-                active_anchor_hs = torch.stack(
-                    [anchor_list[i] for i in active_match_indices]
-                ).float()
+                gather_idx = torch.tensor(
+                    [anchor_indices[i] for i in active_batch_indices],
+                    dtype=torch.long,
+                    device=hidden_states.device,
+                )
+                active_anchor_hs = hidden_states.index_select(0, gather_idx).float()
                 t1_cast = _now_ns() if gen_enabled else 0
 
-                t0_proj = _now_ns() if gen_enabled else 0
-                
-            with (hspec_record_function("hspec/proposal/mean_to_tensor", use_npu_stream=True)
-                  if prof_enabled else nullcontext()):
-                mean_batch = torch.stack(
-                    [cached.mean for cached in active_cached_tables]
-                )
-            
-            with (hspec_record_function("hspec/proposal/build_batched_table_tensors", use_npu_stream=True)
-                  if prof_enabled else nullcontext()):
-                comp_batch = torch.stack(
-                    [cached.components for cached in active_cached_tables]
-                )
             with (hspec_record_function("hspec/proposal/project", use_npu_stream=True)
                   if prof_enabled else nullcontext()):
+                t0_proj = _now_ns() if gen_enabled else 0
+                use_full_cached_batch = (
+                    len(active_table_rows) == len(batch_table_cache.cached_tables)
+                    and all(row == idx for idx, row in enumerate(active_table_rows))
+                )
+                if use_full_cached_batch:
+                    mean_batch = batch_table_cache.mean_batch
+                    components_t_batch = batch_table_cache.components_t_batch
+                else:
+                    table_rows = torch.tensor(
+                        active_table_rows,
+                        dtype=torch.long,
+                        device=hidden_states.device,
+                    )
+                    mean_batch = batch_table_cache.mean_batch.index_select(0, table_rows)
+                    components_t_batch = batch_table_cache.components_t_batch.index_select(
+                        0, table_rows,
+                    )
                 z_batch = torch.bmm(
                     (active_anchor_hs - mean_batch).unsqueeze(1),
-                    comp_batch.transpose(1, 2),
+                    components_t_batch,
                 ).squeeze(1)
                 t1_proj = _now_ns() if gen_enabled else 0
 
-                t0_sim = _now_ns() if gen_enabled else 0
-                
             with (hspec_record_function("hspec/proposal/match", use_npu_stream=True)
                   if prof_enabled else nullcontext()):
-                pending.extend(
-                    self._match_projected_batch(
-                        active_match_indices,
-                        active_cached_tables,
-                        z_batch,
-                        decoded_lens,
-                    )
+                t0_sim = _now_ns() if gen_enabled else 0
+                if use_full_cached_batch:
+                    keys_batch = batch_table_cache.keys_batch
+                    invalid_key_mask = batch_table_cache.invalid_key_mask
+                else:
+                    keys_batch = batch_table_cache.keys_batch.index_select(0, table_rows)
+                    invalid_key_mask = batch_table_cache.invalid_key_mask.index_select(0, table_rows)
+                best_sims, best_idxs = self._match_projected_batch(
+                    z_batch,
+                    keys_batch,
+                    invalid_key_mask,
                 )
                 t1_sim = _now_ns() if gen_enabled else 0
 
             if gen_enabled:
-                for j, (batch_idx, _, _, _, _) in enumerate(pending):
+                for row, batch_idx in enumerate(active_batch_indices):
                     if batch_idx == gen_req_idx:
-                        trace_pending_j = j
+                        trace_pending_j = row
                         break
-                if trace_candidate_selected and trace_pending_j is None:
-                    trace_skip_reason = "empty_entry_window"
                 td = getattr(self, "_hspec_gen_timing", {}) if hasattr(self, "_hspec_gen_timing") else {}
                 td.update({
                     "cast_fp32_ms": _ns_to_ms(t1_cast - t0_cast) if t0_cast else 0.0,
@@ -1096,6 +1211,9 @@ class HSpecProposer(Proposer):
                     "similarity_ms": _ns_to_ms(t1_sim - t0_sim) if t0_sim else 0.0,
                 })
                 self._hspec_gen_timing = td
+        else:
+            best_sims = None
+            best_idxs = None
 
         if HSPEC_DEBUG:
             try:
@@ -1113,29 +1231,31 @@ class HSpecProposer(Proposer):
                 cached_for_debug = None
                 best_idx_val = -1
                 sim_val = float("nan")
-                for (i, sim_t, idx_t, cached, _) in pending:
-                    if i != di:
-                        continue
-                    cached_for_debug = cached
-                    try:
-                        sim_val = float(sim_t.detach().float().item())
-                    except Exception:
-                        sim_val = float("nan")
-                    try:
-                        best_idx_val = int(idx_t.detach().item())
-                    except Exception:
-                        best_idx_val = -1
-                    pending_line = (
-                        f"CACHE_MATCH [req_idx={di}] {corr_id} | "
-                        f"decoded_tokens_at_match={decoded_tokens_at_match} | "
-                        f"best_idx={best_idx_val} sim={sim_val:.6f} n_entries={cached.n_entries}"
-                    )
-                    break
+                if best_sims is not None and best_idxs is not None:
+                    for row, batch_idx in enumerate(active_batch_indices):
+                        if batch_idx != di:
+                            continue
+                        cached = active_cached_tables[row]
+                        cached_for_debug = cached
+                        try:
+                            sim_val = float(best_sims[row].detach().float().item())
+                        except Exception:
+                            sim_val = float("nan")
+                        try:
+                            best_idx_val = int(best_idxs[row].detach().item())
+                        except Exception:
+                            best_idx_val = -1
+                        pending_line = (
+                            f"CACHE_MATCH [req_idx={di}] {corr_id} | "
+                            f"decoded_tokens_at_match={decoded_tokens_at_match} | "
+                            f"best_idx={best_idx_val} sim={sim_val:.6f} n_entries={cached.n_entries}"
+                        )
+                        break
                 if pending_line is None:
                     pending_line = (
                         f"CACHE_MATCH [req_idx={di}] {corr_id} | "
                         f"decoded_tokens_at_match={decoded_tokens_at_match} | "
-                        f"not_in_pending (pending_size={len(pending)})"
+                        f"not_in_pending (pending_size={len(active_batch_indices)})"
                     )
                 else:
                     # (1) Print cache table contents (all entries) with correlation to decoded state
@@ -1161,8 +1281,8 @@ class HSpecProposer(Proposer):
                             # Get similarity for this entry (if keys available)
                             try:
                                 # Use the projected anchor_hs to compute similarity
-                                if di < len(anchor_list) and anchor_list[di] is not None:
-                                    hs_f = anchor_list[di].float()
+                                if trace_anchor is not None:
+                                    hs_f = trace_anchor.float()
                                     z = (hs_f - cached_for_debug.mean) @ cached_for_debug.components.T
                                     # z = F.normalize(z, dim=0)
                                     entry_sim = float((cached_for_debug.keys[entry_idx] @ z).item())
@@ -1185,7 +1305,7 @@ class HSpecProposer(Proposer):
             except Exception:
                 logger.exception("HSPEC DEBUG: failed to log pending list")
 
-        if not pending:
+        if not active_batch_indices or best_sims is None or best_idxs is None:
             if gen_enabled and batch_size > 0:
                 di = min(gen_req_idx, batch_size - 1)
                 try:
@@ -1218,19 +1338,20 @@ class HSpecProposer(Proposer):
         # 4. Single device → host sync for the whole batch
         t0_stack = _now_ns() if gen_enabled else 0
         with hspec_record_function("hspec/proposal/device_to_host_sync", use_npu_stream=True):
-            sim_stack = torch.stack([p[1] for p in pending])    # (P,)
-            idx_stack = torch.stack([p[2] for p in pending])    # (P,)
             t1_stack = _now_ns() if gen_enabled else 0
             t0_copy = _now_ns() if gen_enabled else 0
-            sims_cpu = sim_stack.cpu().numpy()
-            idxs_cpu = idx_stack.cpu().numpy()
+            sims_cpu = best_sims.cpu().numpy()
+            idxs_cpu = best_idxs.cpu().numpy()
             t1_copy = _now_ns() if gen_enabled else 0
 
         # 5. Draft token retrieval (CPU-only, O(1) per request)
-        for j, (i, _, _, cached, base_pos) in enumerate(pending):
+        hit_rows = np.flatnonzero(sims_cpu >= self.similarity_threshold)
+        pending = []
+        for j in hit_rows.tolist():
+            i = active_batch_indices[j]
+            cached = active_cached_tables[j]
+            base_pos = active_base_positions[j]
             t0_retrieve = _now_ns() if (gen_enabled and i == gen_req_idx) else 0
-            if sims_cpu[j] < self.similarity_threshold:
-                continue
 
             # Adaptive window update
             req_id = req_ids[i]
@@ -1249,6 +1370,7 @@ class HSpecProposer(Proposer):
             results[i] = draft
             self._stat_hits += 1
             self._stat_total_draft_len += len(draft)
+            pending.append((i, sims_cpu[j], idxs_cpu[j], cached, base_pos))
 
             if draft:
                 req_id = req_ids[i]
@@ -1304,7 +1426,7 @@ class HSpecProposer(Proposer):
                 req_state = req_states[di]
                 decoded_len = len(getattr(req_state, "output_token_ids", [])) if req_state is not None else -1
                 pid = prompt_ids[di] if di < len(prompt_ids) else ""
-                anchor = anchor_list[di] if di < len(anchor_list) else None
+                anchor = trace_anchor if di == min(gen_req_idx, batch_size - 1) else None
                 anchor_norm = None
                 if anchor is not None:
                     try:
@@ -1438,6 +1560,7 @@ class HSpecProposer(Proposer):
         if req_id in self._cached_batch_req_ids:
             self._cached_batch_req_ids = ()
             self._cached_batch_prompt_ids = []
+            self._batched_table_cache = None
 
     # interface stubs
 
