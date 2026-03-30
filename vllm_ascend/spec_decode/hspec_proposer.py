@@ -83,6 +83,7 @@ class _CachedPromptTable:
     """
 
     __slots__ = (
+        "mean_cpu", "components_t_cpu", "keys_cpu",
         "mean", "components", "keys",
         "rollout_seqs", "entry_rollout_idx", "entry_offset",
         "draft_prefix_tokens", "draft_prefix_lens",
@@ -93,6 +94,9 @@ class _CachedPromptTable:
 
     def __init__(
         self,
+        mean_cpu: np.ndarray,
+        components_t_cpu: np.ndarray,
+        keys_cpu: np.ndarray,
         mean: torch.Tensor,
         components: torch.Tensor,
         keys: torch.Tensor,
@@ -108,6 +112,9 @@ class _CachedPromptTable:
         max_wnd: int = 28,
         min_wnd: int = 2,
     ):
+        self.mean_cpu = mean_cpu                      # (D,) float32, CPU
+        self.components_t_cpu = components_t_cpu      # (D,K) float32, CPU
+        self.keys_cpu = keys_cpu                      # (M,K) float32, CPU
         self.mean = mean                            # (D,)  float32, device
         self.components = components                  # (K,D) float32, device
         self.keys = keys                              # (M,K) float32, device, L2-norm'd
@@ -572,6 +579,7 @@ class HSpecProposer(Proposer):
         dtype: torch.dtype,
         device: torch.device,
     ) -> Optional[_BatchedPromptTableCache]:
+        prof_enabled = hspec_profile_context_enabled()
         req_ids_tuple = tuple(str(req_id) for req_id in req_ids)
         cached = self._batched_table_cache
         if (
@@ -583,35 +591,40 @@ class HSpecProposer(Proposer):
 
         batch_indices: List[int] = []
         cached_tables: List[_CachedPromptTable] = []
-        for i, pid in enumerate(prompt_ids):
-            prompt_table = self._cache.get(pid)
-            if prompt_table is None or prompt_table.n_entries <= 0:
-                continue
-            batch_indices.append(i)
-            cached_tables.append(prompt_table)
+        with hspec_record_function("hspec/proposal/build_batch_indices_cached_tables"):
+            for i, pid in enumerate(prompt_ids):
+                prompt_table = self._cache.get(pid)
+                if prompt_table is None or prompt_table.n_entries <= 0:
+                    continue
+                batch_indices.append(i)
+                cached_tables.append(prompt_table)
 
         if not batch_indices:
             self._batched_table_cache = None
             return None
-
+        
         mean_batch, components_t_batch, keys_batch, key_lengths, invalid_key_mask = \
             self._build_batched_table_tensors(cached_tables, dtype, device)
-        batch_idx_to_row = {
-            batch_idx: row for row, batch_idx in enumerate(batch_indices)
-        }
-        cached = _BatchedPromptTableCache(
-            req_ids=req_ids_tuple,
-            cache_generation=self._cache_generation,
-            batch_indices=batch_indices,
-            batch_idx_to_row=batch_idx_to_row,
-            cached_tables=cached_tables,
-            mean_batch=mean_batch,
-            components_t_batch=components_t_batch,
-            keys_batch=keys_batch,
-            key_lengths=key_lengths,
-            invalid_key_mask=invalid_key_mask,
-        )
-        self._batched_table_cache = cached
+        
+        with hspec_record_function("hspec/proposal/build_batch_idx_to_row"):
+            batch_idx_to_row = {
+                batch_idx: row for row, batch_idx in enumerate(batch_indices)
+            }
+        
+        with hspec_record_function("hspec/proposal/build_cached"):
+            cached = _BatchedPromptTableCache(
+                req_ids=req_ids_tuple,
+                cache_generation=self._cache_generation,
+                batch_indices=batch_indices,
+                batch_idx_to_row=batch_idx_to_row,
+                cached_tables=cached_tables,
+                mean_batch=mean_batch,
+                components_t_batch=components_t_batch,
+                keys_batch=keys_batch,
+                key_lengths=key_lengths,
+                invalid_key_mask=invalid_key_mask,
+            )
+            self._batched_table_cache = cached
         return cached
 
     def _maybe_log_metrics(self) -> None:
@@ -748,6 +761,7 @@ class HSpecProposer(Proposer):
         mean_np = np.array(data["mean"], dtype=np.float32, copy=True)
         comp_np = np.array(data["components"], dtype=np.float32, copy=True)
         keys_np = np.array(data["keys"], dtype=np.float32, copy=True)
+        components_t_cpu = np.ascontiguousarray(comp_np.transpose(1, 0))
 
         mean = torch.from_numpy(mean_np).to(self.device, non_blocking=True)
 
@@ -786,6 +800,9 @@ class HSpecProposer(Proposer):
             draft_prefix_lens[entry_idx] = take
 
         return _CachedPromptTable(
+            mean_cpu=mean_np,
+            components_t_cpu=components_t_cpu,
+            keys_cpu=keys_np,
             mean=mean,
             components=components,
             keys=keys,
@@ -823,6 +840,7 @@ class HSpecProposer(Proposer):
             key_lengths:        (B,)
             invalid_key_mask:   (B, M_max)
         """
+        prof_enabled = hspec_profile_context_enabled()
         num_rows = len(cached_tables)
         if num_rows == 0:
             empty = torch.empty((0,), dtype=dtype, device=device)
@@ -833,36 +851,55 @@ class HSpecProposer(Proposer):
         k_max = max(int(cached.components.shape[0]) for cached in cached_tables)
         m_max = max(int(cached.n_entries) for cached in cached_tables)
         hidden_dim = int(cached_tables[0].mean.shape[0])
-        mean_batch = torch.stack(
-            [cached.mean.to(dtype=dtype) for cached in cached_tables]
-        )
+        # Rebuild on CPU to avoid many tiny NPU slice/copy kernels, then upload
+        with (hspec_record_function("hspec/proposal/rebuild_on_cpu")
+              if prof_enabled else nullcontext()):
+            mean_batch_cpu = np.stack(
+                [cached.mean_cpu for cached in cached_tables],
+                axis=0,
+            )
+            components_t_batch_cpu = np.zeros(
+                (num_rows, hidden_dim, k_max),
+                dtype=np.float32,
+            )
+            keys_batch_cpu = np.zeros(
+                (num_rows, m_max, k_max),
+                dtype=np.float32,
+            )
+            key_lengths_cpu = np.empty((num_rows,), dtype=np.int64)
 
-        components_t_batch = torch.zeros(
-            (num_rows, hidden_dim, k_max),
-            dtype=dtype,
-            device=device,
-        )
-        keys_batch = torch.zeros(
-            (num_rows, m_max, k_max),
-            dtype=dtype,
-            device=device,
-        )
-        key_lengths = torch.empty(
-            (num_rows,),
-            dtype=torch.long,
-            device=device,
-        )
+        with (hspec_record_function("hspec/proposal/rebuild_components_keys_mask")
+              if prof_enabled else nullcontext()):
+            for row, cached in enumerate(cached_tables):
+                k_i = int(cached.components_t_cpu.shape[1])
+                m_i = int(cached.n_entries)
+                components_t_batch_cpu[row, :, :k_i] = cached.components_t_cpu[:, :k_i]
+                if m_i > 0:
+                    keys_batch_cpu[row, :m_i, :k_i] = cached.keys_cpu[:m_i, :k_i]
+                key_lengths_cpu[row] = m_i
 
-        for row, cached in enumerate(cached_tables):
-            k_i = int(cached.components.shape[0])
-            m_i = int(cached.n_entries)
-            components_t_batch[row, :, :k_i] = cached.components[:k_i].transpose(0, 1).to(dtype=dtype)
-            if m_i > 0:
-                keys_batch[row, :m_i, :k_i] = cached.keys[:m_i, :k_i].to(dtype=dtype)
-            key_lengths[row] = m_i
+            invalid_key_mask_cpu = (
+                np.arange(m_max, dtype=np.int64)[None, :]
+                >= key_lengths_cpu[:, None]
+            )
 
-        positions = torch.arange(m_max, device=device).unsqueeze(0)
-        invalid_key_mask = positions >= key_lengths.unsqueeze(1)
+        with (hspec_record_function("hspec/proposal/convert_to_npu")
+              if prof_enabled else nullcontext()):
+            mean_batch = torch.from_numpy(mean_batch_cpu).to(
+                device=device, dtype=dtype, non_blocking=True,
+            )
+            components_t_batch = torch.from_numpy(components_t_batch_cpu).to(
+                device=device, dtype=dtype, non_blocking=True,
+            )
+            keys_batch = torch.from_numpy(keys_batch_cpu).to(
+                device=device, dtype=dtype, non_blocking=True,
+            )
+            key_lengths = torch.from_numpy(key_lengths_cpu).to(
+                device=device, dtype=torch.long, non_blocking=True,
+            )
+            invalid_key_mask = torch.from_numpy(invalid_key_mask_cpu).to(
+                device=device, dtype=torch.bool, non_blocking=True,
+            )
 
         return mean_batch, components_t_batch, keys_batch, key_lengths, invalid_key_mask
 
@@ -1112,38 +1149,42 @@ class HSpecProposer(Proposer):
         if batch_table_cache is None and gen_enabled and batch_size > 0:
             trace_skip_reason = "prompt_not_cached"
 
-        if batch_table_cache is not None:
-            for i in range(batch_size):
-                anchor_idx = anchor_indices[i] if i < len(anchor_indices) else -1
-                if anchor_idx < 0:
+        with (hspec_record_function("hspec/proposal/get_active_batch_indices_and_rows", use_npu_stream=True)
+                  if prof_enabled else nullcontext()):
+            if batch_table_cache is not None:
+                for i in range(batch_size):
+                    anchor_idx = anchor_indices[i] if i < len(anchor_indices) else -1
+                    if anchor_idx < 0:
+                        if gen_enabled and i == gen_req_idx:
+                            trace_skip_reason = "anchor_none"
+                        continue
+                    row = batch_table_cache.batch_idx_to_row.get(i)
+                    if row is None:
+                        if gen_enabled and i == gen_req_idx:
+                            trace_skip_reason = "prompt_not_cached"
+                        continue
+                    if len(valid_sampled_token_ids[i]) < self.min_match_len:
+                        if gen_enabled and i == gen_req_idx:
+                            trace_skip_reason = (
+                                f"below_min_match_len:{len(valid_sampled_token_ids[i])}"
+                            )
+                        continue
+                    active_batch_indices.append(i)
+                    active_table_rows.append(row)
                     if gen_enabled and i == gen_req_idx:
-                        trace_skip_reason = "anchor_none"
-                    continue
-                row = batch_table_cache.batch_idx_to_row.get(i)
-                if row is None:
-                    if gen_enabled and i == gen_req_idx:
-                        trace_skip_reason = "prompt_not_cached"
-                    continue
-                if len(valid_sampled_token_ids[i]) < self.min_match_len:
-                    if gen_enabled and i == gen_req_idx:
-                        trace_skip_reason = (
-                            f"below_min_match_len:{len(valid_sampled_token_ids[i])}"
-                        )
-                    continue
-                active_batch_indices.append(i)
-                active_table_rows.append(row)
-                if gen_enabled and i == gen_req_idx:
-                    trace_candidate_selected = True
+                        trace_candidate_selected = True
 
-        if batch_table_cache is not None and active_table_rows:
-            active_cached_tables = [
-                batch_table_cache.cached_tables[row]
-                for row in active_table_rows
-            ]
-            active_base_positions = [
-                self._window_base_pos(decoded_lens[batch_idx])
-                for batch_idx in active_batch_indices
-            ]
+        with (hspec_record_function("hspec/proposal/get_active_cached_tables_and_position", use_npu_stream=True)
+                  if prof_enabled else nullcontext()):
+            if batch_table_cache is not None and active_table_rows:
+                active_cached_tables = [
+                    batch_table_cache.cached_tables[row]
+                    for row in active_table_rows
+                ]
+                active_base_positions = [
+                    self._window_base_pos(decoded_lens[batch_idx])
+                    for batch_idx in active_batch_indices
+                ]
 
         if active_batch_indices and batch_table_cache is not None:
             t0_cast = _now_ns() if gen_enabled else 0
