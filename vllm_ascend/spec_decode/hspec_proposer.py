@@ -26,6 +26,17 @@ from typing import Any, Dict, List, Optional, Set
 import numpy as np
 import torch
 import torch.nn.functional as F
+try:
+    import numba
+    from numba import njit, prange
+    from numba.typed import List as NumbaList
+    _HSPEC_NUMBA_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency
+    numba = None
+    njit = None
+    prange = range
+    NumbaList = None
+    _HSPEC_NUMBA_AVAILABLE = False
 
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -61,6 +72,42 @@ HSPEC_GEN_MAX_CALLS = int(os.getenv("HSPEC_GEN_MAX_CALLS", "0"))  # 0 = no limit
 
 # HistoSpec-comparison study: compare against an exact n-gram match baseline.
 HSPEC_ADVAN_NGRAM = int(os.getenv("HSPEC_ADVAN_NGRAM", "3"))
+
+
+if _HSPEC_NUMBA_AVAILABLE:
+    @njit(cache=True, parallel=True)
+    def _hspec_fill_batched_components_keys_numba(
+        components_list,
+        keys_list,
+        components_t_batch_cpu,
+        keys_batch_cpu,
+        key_lengths_cpu,
+    ):
+        for row in prange(len(components_list)):
+            comp_src = components_list[row]
+            key_src = keys_list[row]
+            hidden_dim = comp_src.shape[0]
+            k_i = comp_src.shape[1]
+            m_i = key_src.shape[0]
+
+            for d in range(hidden_dim):
+                for k in range(k_i):
+                    components_t_batch_cpu[row, d, k] = comp_src[d, k]
+
+            for m in range(m_i):
+                for k in range(k_i):
+                    keys_batch_cpu[row, m, k] = key_src[m, k]
+
+            key_lengths_cpu[row] = m_i
+
+
+def _hspec_make_numba_array_list(arrays: List[np.ndarray]):
+    if not _HSPEC_NUMBA_AVAILABLE or NumbaList is None:
+        return None
+    typed_list = NumbaList()
+    for arr in arrays:
+        typed_list.append(arr)
+    return typed_list
 
 
 def _now_ns() -> int:
@@ -366,6 +413,16 @@ class HSpecProposer(Proposer):
         self._cached_batch_req_ids: tuple[str, ...] = ()
         self._cached_batch_prompt_ids: List[str] = []
         self._batched_table_cache: Optional[_BatchedPromptTableCache] = None
+        self._use_numba_rebuild = (
+            _HSPEC_NUMBA_AVAILABLE
+            and os.environ.get("HSPEC_DISABLE_NUMBA_REBUILD", "0") == "0"
+        )
+        self._numba_rebuild_min_rows = int(
+            os.environ.get("HSPEC_NUMBA_REBUILD_MIN_ROWS", "4")
+        )
+        self._numba_rebuild_min_elems = int(
+            os.environ.get("HSPEC_NUMBA_REBUILD_MIN_ELEMS", "262144")
+        )
         # Lightweight local metrics (for functional + perf validation).
         # These live in the vLLM worker process; we never RPC in the hot loop.
         self._stat_calls = 0
@@ -402,11 +459,19 @@ class HSpecProposer(Proposer):
 
         logger.info(
             "HSpec proposer initialised: threshold=%.3f, "
-            "max_draft=%d, cache_cap=%d, fully_batched_match=1",
+            "max_draft=%d, cache_cap=%d, fully_batched_match=1, "
+            "numba_rebuild=%s",
             self.similarity_threshold,
             self.max_draft_tokens,
             self._max_cache_size,
+            str(bool(self._use_numba_rebuild)),
         )
+
+        if self._use_numba_rebuild:
+            try:
+                self._warm_numba_rebuild_kernel()
+            except Exception:
+                logger.debug("HSpec: numba rebuild warmup failed", exc_info=True)
 
     # async prefetch
 
@@ -571,6 +636,27 @@ class HSpecProposer(Proposer):
         self._cached_batch_req_ids = batch_req_ids
         self._cached_batch_prompt_ids = prompt_ids
         return prompt_ids
+
+    def _warm_numba_rebuild_kernel(self) -> None:
+        """Compile the Numba rebuild kernel once outside the hot path."""
+        if not self._use_numba_rebuild:
+            return
+        comp = np.zeros((2, 2), dtype=np.float32)
+        keys = np.zeros((2, 2), dtype=np.float32)
+        comp_list = _hspec_make_numba_array_list([comp])
+        keys_list = _hspec_make_numba_array_list([keys])
+        if comp_list is None or keys_list is None:
+            return
+        comp_out = np.zeros((1, 2, 2), dtype=np.float32)
+        keys_out = np.zeros((1, 2, 2), dtype=np.float32)
+        lens_out = np.empty((1,), dtype=np.int64)
+        _hspec_fill_batched_components_keys_numba(
+            comp_list,
+            keys_list,
+            comp_out,
+            keys_out,
+            lens_out,
+        )
 
     def _get_or_build_batched_table_cache(
         self,
@@ -870,13 +956,37 @@ class HSpecProposer(Proposer):
 
         with (hspec_record_function("hspec/proposal/rebuild_components_keys_mask")
               if prof_enabled else nullcontext()):
-            for row, cached in enumerate(cached_tables):
-                k_i = int(cached.components_t_cpu.shape[1])
-                m_i = int(cached.n_entries)
-                components_t_batch_cpu[row, :, :k_i] = cached.components_t_cpu[:, :k_i]
-                if m_i > 0:
-                    keys_batch_cpu[row, :m_i, :k_i] = cached.keys_cpu[:m_i, :k_i]
-                key_lengths_cpu[row] = m_i
+            total_elems = (num_rows * hidden_dim * k_max) + (num_rows * m_max * k_max)
+            use_numba = (
+                self._use_numba_rebuild
+                and num_rows >= self._numba_rebuild_min_rows
+                and total_elems >= self._numba_rebuild_min_elems
+            )
+            if use_numba:
+                comp_list = _hspec_make_numba_array_list(
+                    [cached.components_t_cpu for cached in cached_tables]
+                )
+                keys_list = _hspec_make_numba_array_list(
+                    [cached.keys_cpu[:cached.n_entries] for cached in cached_tables]
+                )
+                if comp_list is not None and keys_list is not None:
+                    _hspec_fill_batched_components_keys_numba(
+                        comp_list,
+                        keys_list,
+                        components_t_batch_cpu,
+                        keys_batch_cpu,
+                        key_lengths_cpu,
+                    )
+                else:
+                    use_numba = False
+            if not use_numba:
+                for row, cached in enumerate(cached_tables):
+                    k_i = int(cached.components_t_cpu.shape[1])
+                    m_i = int(cached.n_entries)
+                    components_t_batch_cpu[row, :, :k_i] = cached.components_t_cpu[:, :k_i]
+                    if m_i > 0:
+                        keys_batch_cpu[row, :m_i, :k_i] = cached.keys_cpu[:m_i, :k_i]
+                    key_lengths_cpu[row] = m_i
 
             invalid_key_mask_cpu = (
                 np.arange(m_max, dtype=np.int64)[None, :]
