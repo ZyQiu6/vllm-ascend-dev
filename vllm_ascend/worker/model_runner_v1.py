@@ -1974,6 +1974,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         sample_hidden_states: torch.Tensor,
         valid_sampled_token_ids: list[list[int]],
         spec_decode_metadata: Optional[SpecDecodeMetadata],
+        accepted_prefix_lengths: Optional[list[int]] = None,
     ) -> None:
         """Accumulate anchor hidden states for HSpec table building.
 
@@ -2003,19 +2004,61 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # Spec decode path
             num_draft_list = spec_decode_metadata.num_draft_tokens
             bonus_indices = spec_decode_metadata.bonus_logits_indices
+            target_logits_indices = spec_decode_metadata.target_logits_indices
+            cu_num_draft_tokens = spec_decode_metadata.cu_num_draft_tokens
             for i in range(n):
                 sampled_ids = valid_sampled_token_ids[i]
                 if not sampled_ids:
                     continue
+                req_id = self.input_batch.req_ids[i]
                 if num_draft_list[i] == 0:
                     # No drafts for this request – bonus position is
                     # the normal single-token decode position.
                     bonus_idx = bonus_indices[i].item()
-                    req_id = self.input_batch.req_ids[i]
                     hspec_append_step_hs(
                         req_id,
                         sample_hidden_states[bonus_idx].clone().half())
-                # else: has draft tokens → skip (design-doc fallback)
+                    continue
+
+                num_drafts = int(num_draft_list[i])
+                accepted = (
+                    int(accepted_prefix_lengths[i])
+                    if accepted_prefix_lengths is not None and i < len(accepted_prefix_lengths)
+                    else 0
+                )
+                out_len = len(sampled_ids)
+
+                start = (
+                    int(cu_num_draft_tokens[i - 1].item())
+                    if i > 0 else 0
+                )
+                end = start + num_drafts
+                local_target_rows = target_logits_indices[start:end]
+
+                # 1) Accepted draft prefix tokens.
+                for j in range(min(accepted, num_drafts, out_len)):
+                    row_idx = int(local_target_rows[j].item())
+                    hspec_append_step_hs(
+                        req_id,
+                        sample_hidden_states[row_idx].clone().half(),
+                    )
+
+                # 2) The final emitted token after the accepted draft prefix:
+                #    - recovered token at first rejected draft position, or
+                #    - bonus token if all drafts were accepted.
+                if out_len > accepted:
+                    if accepted < num_drafts:
+                        row_idx = int(local_target_rows[accepted].item())
+                        hspec_append_step_hs(
+                            req_id,
+                            sample_hidden_states[row_idx].clone().half(),
+                        )
+                    else:
+                        bonus_idx = int(bonus_indices[i].item())
+                        hspec_append_step_hs(
+                            req_id,
+                            sample_hidden_states[bonus_idx].clone().half(),
+                        )
 
     def _hspec_compute_accepted_prefix_lengths(
         self,
@@ -2800,6 +2843,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         sample_hidden_states,
                         valid_sampled_token_ids,
                         spec_decode_metadata,
+                        accepted_prefix_lengths=accepted_prefix_lengths,
                     )
                 if _hspec_gen and self.input_batch.num_reqs > 0:
                     di = min(_hspec_gen_idx, self.input_batch.num_reqs - 1)
