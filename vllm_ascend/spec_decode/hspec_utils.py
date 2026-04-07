@@ -884,6 +884,8 @@ _hspec_store_lock = _threading.Lock()
 
 # Device-side accumulation buffers:  req_id -> list of (hidden_dim,) tensors
 _hspec_device_buffers: Dict[str, List[torch.Tensor]] = {}
+# Token-side accumulation buffers: req_id -> list of accepted/generated token ids
+_hspec_token_buffers: Dict[str, List[int]] = {}
 
 # Whether collection is enabled (set by model_runner at init)
 _hspec_collection_enabled: bool = False
@@ -930,7 +932,20 @@ def hspec_append_step_hs(req_id: str, hidden_state: torch.Tensor):
         _hspec_device_buffers[req_id].append(hidden_state)
 
 
-def hspec_flush_and_get_all() -> Dict[str, np.ndarray]:
+def hspec_extend_step_tokens(req_id: str, token_ids: List[int]) -> None:
+    """Append the exact token ids whose anchor states were collected this step."""
+    if not _hspec_collection_enabled:
+        return
+    if not token_ids:
+        return
+    req_id = str(req_id)
+    with _hspec_store_lock:
+        if req_id not in _hspec_token_buffers:
+            _hspec_token_buffers[req_id] = []
+        _hspec_token_buffers[req_id].extend(int(t) for t in token_ids)
+
+
+def hspec_flush_and_get_all() -> Dict[str, Dict[str, Any]]:
     """Flush **all** device buffers to CPU and return the complete store.
 
     This is the main entry point called by the rollout code *after*
@@ -939,40 +954,58 @@ def hspec_flush_and_get_all() -> Dict[str, np.ndarray]:
     float16 numpy arrays, and clears the device buffers.
 
     Returns:
-        Dictionary mapping ``req_id`` → ``np.ndarray`` of shape
-        ``(seq_len, hidden_dim)`` in ``float16``.
+        Dictionary mapping ``req_id`` → ``{
+            'hidden_states': np.ndarray[(seq_len, hidden_dim), float16],
+            'token_ids': list[int],
+        }``.
     """
     with _hspec_store_lock:
-        result: Dict[str, np.ndarray] = {}
-        for req_id, tensors in _hspec_device_buffers.items():
+        result: Dict[str, Dict[str, Any]] = {}
+        all_req_ids = set(_hspec_device_buffers.keys()) | set(_hspec_token_buffers.keys())
+        for req_id in all_req_ids:
+            tensors = _hspec_device_buffers.get(req_id, [])
+            token_ids = list(_hspec_token_buffers.get(req_id, []))
+            cpu_array = None
             if tensors:
                 # Stack all step tensors → (seq_len, hidden_dim)
                 stacked = torch.stack(tensors)
                 # Single device→host transfer per request
                 cpu_array = stacked.to(dtype=torch.float16).cpu().numpy()
-                result[str(req_id)] = cpu_array
+            result[str(req_id)] = {
+                "hidden_states": cpu_array,
+                "token_ids": token_ids,
+            }
         _hspec_device_buffers.clear()
+        _hspec_token_buffers.clear()
         return result
 
 
-def hspec_pop_request(req_id: str) -> Optional[np.ndarray]:
+def hspec_pop_request(req_id: str) -> Optional[Dict[str, Any]]:
     """Pop hidden states for a *single* request.
 
     Used by the output-processor when a request finishes (streaming
     scenario).  Falls back to the device buffer if not yet flushed.
 
     Returns:
-        ``np.ndarray`` of shape ``(seq_len, hidden_dim)`` in float16,
+        ``{'hidden_states': np.ndarray | None, 'token_ids': list[int]}``,
         or ``None`` if no data is stored for *req_id*.
     """
     req_id = str(req_id)
     with _hspec_store_lock:
-        if req_id in _hspec_device_buffers:
-            tensors = _hspec_device_buffers.pop(req_id)
-            if tensors:
-                stacked = torch.stack(tensors)
-                return stacked.to(dtype=torch.float16).cpu().numpy()
-        return None
+        has_hs = req_id in _hspec_device_buffers
+        has_tok = req_id in _hspec_token_buffers
+        if not has_hs and not has_tok:
+            return None
+        tensors = _hspec_device_buffers.pop(req_id, [])
+        token_ids = list(_hspec_token_buffers.pop(req_id, []))
+        cpu_array = None
+        if tensors:
+            stacked = torch.stack(tensors)
+            cpu_array = stacked.to(dtype=torch.float16).cpu().numpy()
+        return {
+            "hidden_states": cpu_array,
+            "token_ids": token_ids,
+        }
 
 
 def hspec_clear_store():
@@ -982,6 +1015,7 @@ def hspec_clear_store():
         for tensors in _hspec_device_buffers.values():
             tensors.clear()
         _hspec_device_buffers.clear()
+        _hspec_token_buffers.clear()
 
 
 class HSpecConfig:

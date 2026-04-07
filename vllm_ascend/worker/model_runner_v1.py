@@ -179,6 +179,17 @@ def _hspec_gen_req_idx() -> int:
         return int(os.getenv("HSPEC_GEN_REQ_IDX", os.getenv("HSPEC_DEBUG_REQ_IDX", "3")))
 
 
+def _hspec_align_debug_enabled() -> bool:
+    return os.getenv("HSPEC_ALIGN_DEBUG", "0") != "0"
+
+
+def _hspec_align_debug_max_logs() -> int:
+    try:
+        return max(int(os.getenv("HSPEC_ALIGN_DEBUG_MAX_LOGS", "24")), 0)
+    except Exception:
+        return 24
+
+
 def _hspec_trace_banner(logger) -> None:
     """Print a one-time banner so we can confirm trace code is actually running."""
     if not _hspec_trace_enabled():
@@ -436,6 +447,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self._hspec_verify_pending_accept_len_sum = 0
         self._hspec_verify_pending_accept_advan = 0
         self._hspec_verify_pending_reject_advan = 0
+        self._hspec_align_debug_logs = 0
 
         # kv role
         self.is_kv_producer = False
@@ -1994,12 +2006,26 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 if not sampled_ids:
                     continue
                 req_id = self.input_batch.req_ids[i]
+                appended_count = 0
                 # Clone on device in fp16 to save memory.  The clone
                 # is necessary because `sample_hidden_states` is a
                 # view into `hidden_states` which is overwritten each
                 # step.
                 hspec_append_step_hs(
                     req_id, sample_hidden_states[i].clone().half())
+                appended_count += 1
+                if (_hspec_align_debug_enabled()
+                        and appended_count != len(sampled_ids)
+                        and self._hspec_align_debug_logs < _hspec_align_debug_max_logs()):
+                    self._hspec_align_debug_logs += 1
+                    logger.warning(
+                        "HSPEC ALIGN DEBUG model_runner accumulate mismatch: "
+                        "req_id=%s mode=non_spec out_len=%d appended=%d sampled_ids=%s",
+                        str(req_id),
+                        int(len(sampled_ids)),
+                        int(appended_count),
+                        list(sampled_ids),
+                    )
         else:
             # Spec decode path
             num_draft_list = spec_decode_metadata.num_draft_tokens
@@ -2011,6 +2037,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 if not sampled_ids:
                     continue
                 req_id = self.input_batch.req_ids[i]
+                appended_count = 0
                 if num_draft_list[i] == 0:
                     # No drafts for this request – bonus position is
                     # the normal single-token decode position.
@@ -2018,6 +2045,20 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     hspec_append_step_hs(
                         req_id,
                         sample_hidden_states[bonus_idx].clone().half())
+                    appended_count += 1
+                    if (_hspec_align_debug_enabled()
+                            and appended_count != len(sampled_ids)
+                            and self._hspec_align_debug_logs < _hspec_align_debug_max_logs()):
+                        self._hspec_align_debug_logs += 1
+                        logger.warning(
+                            "HSPEC ALIGN DEBUG model_runner accumulate mismatch: "
+                            "req_id=%s mode=spec_no_draft out_len=%d appended=%d bonus_idx=%d sampled_ids=%s",
+                            str(req_id),
+                            int(len(sampled_ids)),
+                            int(appended_count),
+                            int(bonus_idx),
+                            list(sampled_ids),
+                        )
                     continue
 
                 num_drafts = int(num_draft_list[i])
@@ -2042,6 +2083,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         req_id,
                         sample_hidden_states[row_idx].clone().half(),
                     )
+                    appended_count += 1
 
                 # 2) The final emitted token after the accepted draft prefix:
                 #    - recovered token at first rejected draft position, or
@@ -2053,12 +2095,31 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                             req_id,
                             sample_hidden_states[row_idx].clone().half(),
                         )
+                        appended_count += 1
                     else:
                         bonus_idx = int(bonus_indices[i].item())
                         hspec_append_step_hs(
                             req_id,
                             sample_hidden_states[bonus_idx].clone().half(),
                         )
+                        appended_count += 1
+
+                if (_hspec_align_debug_enabled()
+                        and appended_count != out_len
+                        and self._hspec_align_debug_logs < _hspec_align_debug_max_logs()):
+                    self._hspec_align_debug_logs += 1
+                    logger.warning(
+                        "HSPEC ALIGN DEBUG model_runner accumulate mismatch: "
+                        "req_id=%s mode=spec out_len=%d appended=%d num_drafts=%d accepted_prefix_len=%d "
+                        "local_target_rows=%d sampled_ids=%s",
+                        str(req_id),
+                        int(out_len),
+                        int(appended_count),
+                        int(num_drafts),
+                        int(accepted),
+                        int(local_target_rows.numel()),
+                        list(sampled_ids),
+                    )
 
     def _hspec_compute_accepted_prefix_lengths(
         self,
@@ -2790,6 +2851,21 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # NOTE(woosuk): As an exception, when using PP, the scheduler sends
             # the sampled tokens back, because there's no direct communication
             # between the first-stage worker and the last-stage worker.
+            if (self._hspec_collect
+                    and not self.use_async_scheduling):
+                try:
+                    from vllm_ascend.spec_decode.hspec_utils import (
+                        hspec_extend_step_tokens,
+                    )
+                    n = min(num_sampled_tokens, len(valid_sampled_token_ids))
+                    for req_idx in range(n):
+                        sampled_ids = valid_sampled_token_ids[req_idx]
+                        if not sampled_ids:
+                            continue
+                        req_id = self.input_batch.req_ids[req_idx]
+                        hspec_extend_step_tokens(req_id, sampled_ids)
+                except Exception:
+                    pass
             for req_idx in range(num_sampled_tokens):
                 if self.use_async_scheduling:
                     sampled_ids = [-1] * 1 if \
